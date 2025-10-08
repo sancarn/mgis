@@ -204,6 +204,7 @@ let
         queryLayer = TQuadTree
     ],
     TQuadTreeQueryOperator = type function (candidate as TShape, q as TShape) as logical,
+    TRowQueryOperator = type function (candidate as record) as logical,
     QuadTreeBoxesIntersect = Value.ReplaceType(
         (b1 as record, b2 as record) as logical => (
             not (
@@ -464,6 +465,17 @@ let
         ),
         type function (quadTree as TQuadTree, shape as TShape, operator as TQuadTreeQueryOperator) as list
     ),
+    QuadTreeNodePrune = Value.ReplaceType(
+        (node as record, ids as list) as record => (
+            let
+                fromNode = if List.MatchesAll(node[shapes], each List.Contains(ids, Record.Field(_, "__rowid__"))) then node else {},
+                fromChildren = if node[children] <> null then List.Transform(node[children], (c as record) as record => @QuadTreeNodePrune(c, ids)) else {},
+                newNode = Record.TransformFields(node, {"shapes", each fromNode, "children", each fromChildren})
+            in
+                newNode
+        ),
+        type function (node as TQuadTreeNode, ids as list) as TQuadTreeNode
+    ),
     LayerCreateBlank = Value.ReplaceType(
         (geometryColumn as nullable text, capacity as nullable number) as record => (
             let
@@ -504,53 +516,98 @@ let
         ),
         type function (tbl as table, geometryColumn as text) as TLayer
     ),
-    LayerInsertRow = Value.ReplaceType(
-        (layer as record, row as record) as record => (
+	LayerInsertRows = Value.ReplaceType(
+		(layer as record, rows as list) as record => (
+			let
+				baseTable = EnsureRowIdColumn(layer[table]),
+				nextId0 = if Table.RowCount(baseTable) = 0 then 0 else 1 + List.Max(Table.Column(baseTable, "__rowid__")),
+				// 1) Ensure __rowid__ present on all rows, assigning sequentially from nextId0 when missing
+				assignIds = (state as record, r as record) as record => (
+					let
+						rid = state[nextId],
+						rWithId = if Record.HasFields(r, "__rowid__") then Record.TransformFields(r, {"__rowid__", each rid}) else Record.AddField(r, "__rowid__", rid),
+						nextId1 = state[nextId] + 1
+					in
+						[rowsOut = state[rowsOut] & {rWithId}, nextId = nextId1]
+				),
+				assigned = List.Accumulate(rows ?? {}, [rowsOut = {}, nextId = nextId0], assignIds),
+				rowsWithIds = assigned[rowsOut],
+				// 2) Ensure shapes have corresponding __rowid__
+				shapesWithIds = List.Transform(
+					rowsWithIds,
+					(r as record) as record => (
+						let
+							s0 = Record.Field(r, layer[geometryColumn]),
+							rid = Record.Field(r, "__rowid__"),
+							s1 = if Record.HasFields(s0, "__rowid__") then Record.TransformFields(s0, {"__rowid__", each rid}) else Record.AddField(s0, "__rowid__", rid)
+						in
+							s1
+					)
+				),
+				// 3) Recursively add shapes to quadtree (one-by-one, preserving insert semantics)
+				qt1 = List.Accumulate(shapesWithIds, layer[queryLayer], QuadTreeInsert),
+				// 4) Insert all prepared rows into the table in a single batch
+				newTable = if List.Count(rowsWithIds) = 0 then baseTable else Table.InsertRows(baseTable, 0, rowsWithIds)
+			in
+				[
+					table = newTable,
+					geometryColumn = layer[geometryColumn],
+					queryLayer = qt1
+				]
+		),
+		type function (layer as TLayer, rows as list) as TLayer
+	),
+    LayerSpatialQuery = Value.ReplaceType(
+        (layer as record, shape as record, gisOperator as record) as record => (
             let
-                // ensure table has __rowid__
-                baseTable = EnsureRowIdColumn(layer[table]),
-                nextId = if Table.RowCount(baseTable) = 0 then 0 else 1 + List.Max(Table.Column(baseTable, "__rowid__")),
-                rowHasId = Record.HasFields(row, "__rowid__"),
-                rowId = if rowHasId then Record.Field(row, "__rowid__") else nextId,
-                rowWithId = if rowHasId then row else Record.AddField(row, "__rowid__", rowId),
-                shape0 = Record.Field(rowWithId, layer[geometryColumn]),
-                shape1 = if Record.HasFields(shape0, "__rowid__") then Record.TransformFields(shape0, {"__rowid__", each rowId}) else Record.AddField(shape0, "__rowid__", rowId),
-                inserted = QuadTreeInsert(layer[queryLayer], shape1),
-                newTable = Table.InsertRows(baseTable, 0, {rowWithId})
-            in
-                [
-                    table = newTable,
-                    geometryColumn = layer[geometryColumn],
-                    queryLayer = inserted
-                ]
-        ),
-        type function (layer as TLayer, row as record) as TLayer
-    ),
-    LayerQuery = Value.ReplaceType(
-        (layer as record, shape as record, operator as record) as list => (
-            let
-                shapes = QuadTreeQuery(layer[queryLayer], shape, operator),
+                shapes = QuadTreeQuery(layer[queryLayer], shape, gisOperator),
                 ids = List.Transform(List.Select(shapes, each Record.HasFields(_, "__rowid__") and (Record.Field(_, "__rowid__") <> null)), each Record.Field(_, "__rowid__")),
                 idsDistinct = List.Distinct(ids),
-                selected = Table.SelectRows(layer[table], (r as record) as logical => List.Contains(idsDistinct, Record.Field(r, "__rowid__")))
+                selected = Table.SelectRows(layer[table], (r as record) as logical => List.Contains(idsDistinct, Record.Field(r, "__rowid__"))),
+                filteredQuadTree = [
+                    root = QuadTreeNodePrune(layer[queryLayer][root], idsDistinct),
+                    capacity = layer[queryLayer][capacity]
+                ]
             in
-                Table.ToRecords(selected)
+                [
+                    table = selected,
+                    geometryColumn = layer[geometryColumn],
+                    queryLayer = filteredQuadTree
+                ]
         ),
-        type function (layer as TLayer, shape as TShape, operator as TQuadTreeQueryOperator) as list
+        type function (layer as TLayer, shape as TShape, gisOperator as TQuadTreeQueryOperator) as TLayer
+    ),
+    LayerRelationalQuery = Value.ReplaceType(
+        (layer as record, operator as function) as record => (
+            let
+                selected = Table.SelectRows(layer[table], each operator(_)),
+                selectedIDs = List.Transform(selected, each Record.Field(_, "__rowid__")),
+                filteredQuadTree = [
+                    root = QuadTreeNodePrune(layer[queryLayer][root], selectedIDs),
+                    capacity = layer[queryLayer][capacity]
+                ]
+            in
+                [
+                    table = selected,
+                    geometryColumn = layer[geometryColumn],
+                    queryLayer = filteredQuadTree
+                ]
+        ),
+        type function (layer as TLayer, operator as TRowQueryOperator) as TLayer
     )
 in
     [
         gisShapeCreateFromWKT = ShapeCreateFromWKT,
         gisLayerCreateBlank = LayerCreateBlank,
         gisLayerCreateFromTable = LayerCreateFromTable,
-        gisLayerQuery = LayerQuery,
+        gisLayerSpatialQuery = LayerSpatialQuery,
         gisLayerQueryOperators = [
             gisIntersects = QuadTreeOperatorIntersect,
             gisContains = QuadTreeOperatorContains,
             gisWithin = QuadTreeOperatorWithin,
             gisQueryOperatorType = TQuadTreeQueryOperator //Provided for custom operators
         ],
-        gisLayerInsertRow = LayerInsertRow
+		gisLayerInsertRows = LayerInsertRows
     ]
 
 
