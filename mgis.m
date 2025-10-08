@@ -47,7 +47,8 @@ let
         Kind = text,
         //Geometry as TBasePoint | TBaseLineString | TBasePolygon | TBaseMultiPoint | TBaseMultiLineString | TBaseMultiPolygon | TBaseGeometryCollection
         Geometry = any,  //Hack: No union types in M-lang
-        Envelope = TShapeEnvelope
+        Envelope = TShapeEnvelope,
+        __rowid__ = nullable number
     ],
     privGetEnvelope = (geometry as any) as record => (
         //Recursive switch statement based on geometry.Kind
@@ -162,10 +163,19 @@ let
             in [
                 Kind = baseGeometry[Kind],
                 Geometry = baseGeometry,
-                Envelope = envelope
+                Envelope = envelope,
+                __rowid__ = null
             ] 
         ), 
         type function (wkt as text) as TShape
+    ),
+    // Ensures a table has a numeric __rowid__ column unique per row. If absent, adds it as index starting 0.
+    EnsureRowIdColumn = (tbl as table) as table => (
+        let
+            hasCol = Table.HasColumns(tbl, "__rowid__"),
+            withId = if hasCol then tbl else Table.AddIndexColumn(tbl, "__rowid__", 0, 1, Int64.Type)
+        in
+            withId
     ),
     TQuadTreeNode = type [
         //Shapes is where the actual shapes are stored. Sometimes a polygon or line may overlap multiple leaves,
@@ -456,9 +466,13 @@ let
     ),
     LayerCreateBlank = Value.ReplaceType(
         (geometryColumn as nullable text, capacity as nullable number) as record => (
+            let
+                geomCol = geometryColumn ?? "shape",
+                tbl = #table({"__rowid__", geomCol}, {})
+            in
             [
-                table = #table({}),
-                geometryColumn = geometryColumn ?? "shape",
+                table = tbl,
+                geometryColumn = geomCol,
                 queryLayer = QuadTreeCreate(capacity ?? 10, null)
             ]
         ),
@@ -467,13 +481,23 @@ let
     LayerCreateFromTable = Value.ReplaceType(
         (tbl as table, geometryColumn as text) as record => (
             let
-                qtCapacity = Table.RowCount(tbl) / 10,
+                tblWithId = EnsureRowIdColumn(tbl),
+                qtCapacity = Table.RowCount(tblWithId) / 10,
                 qt = QuadTreeCreate(qtCapacity, null),
-                //recursive insert
-                inserted = List.Accumulate(Table.TransformRows(tbl, each _[geometryColumn]), qt, QuadTreeInsert)
+                shapesWithIds = Table.TransformRows(
+                    tblWithId,
+                    (r as record) as record =>
+                        let
+                            s = Record.Field(r, geometryColumn),
+                            sid = Record.Field(r, "__rowid__"),
+                            s2 = if Record.HasFields(s, "__rowid__") then Record.TransformFields(s, {"__rowid__", each sid}) else Record.AddField(s, "__rowid__", sid)
+                        in
+                            s2
+                ),
+                inserted = List.Accumulate(shapesWithIds, qt, QuadTreeInsert)
             in 
                 [
-                    table = tbl,
+                    table = tblWithId,
                     geometryColumn = geometryColumn,
                     queryLayer = inserted
                 ]
@@ -483,9 +507,16 @@ let
     LayerInsertRow = Value.ReplaceType(
         (layer as record, row as record) as record => (
             let
-                shape = Record.Field(row, layer[geometryColumn]),
-                inserted = QuadTreeInsert(layer[queryLayer], shape),
-                newTable = Table.InsertRows(layer[table], 0, {row})
+                // ensure table has __rowid__
+                baseTable = EnsureRowIdColumn(layer[table]),
+                nextId = if Table.RowCount(baseTable) = 0 then 0 else 1 + List.Max(Table.Column(baseTable, "__rowid__")),
+                rowHasId = Record.HasFields(row, "__rowid__"),
+                rowId = if rowHasId then Record.Field(row, "__rowid__") else nextId,
+                rowWithId = if rowHasId then row else Record.AddField(row, "__rowid__", rowId),
+                shape0 = Record.Field(rowWithId, layer[geometryColumn]),
+                shape1 = if Record.HasFields(shape0, "__rowid__") then Record.TransformFields(shape0, {"__rowid__", each rowId}) else Record.AddField(shape0, "__rowid__", rowId),
+                inserted = QuadTreeInsert(layer[queryLayer], shape1),
+                newTable = Table.InsertRows(baseTable, 0, {rowWithId})
             in
                 [
                     table = newTable,
@@ -497,7 +528,13 @@ let
     ),
     LayerQuery = Value.ReplaceType(
         (layer as record, shape as record, operator as record) as list => (
-            QuadTreeQuery(layer[queryLayer], shape, operator)
+            let
+                shapes = QuadTreeQuery(layer[queryLayer], shape, operator),
+                ids = List.Transform(List.Select(shapes, each Record.HasFields(_, "__rowid__") and (Record.Field(_, "__rowid__") <> null)), each Record.Field(_, "__rowid__")),
+                idsDistinct = List.Distinct(ids),
+                selected = Table.SelectRows(layer[table], (r as record) as logical => List.Contains(idsDistinct, Record.Field(r, "__rowid__")))
+            in
+                Table.ToRecords(selected)
         ),
         type function (layer as TLayer, shape as TShape, operator as TQuadTreeQueryOperator) as list
     )
