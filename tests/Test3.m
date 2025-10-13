@@ -3,8 +3,7 @@ let
     GISLib = mgis,
 
     // --- Shortcuts ---
-    gisShapeCreateFromWKT   = GISLib[gisShapeCreateFromWKT],
-    gisLayerCreateFromTable = GISLib[gisLayerCreateFromTable],
+    gisLayerCreateFromTableWithWKT = GISLib[gisLayerCreateFromTableWithWKT],
     gisLayerJoinSpatial     = GISLib[gisLayerJoinSpatial],
     gisContains             = GISLib[gisLayerQueryOperators][gisContains],
     gisIntersects           = GISLib[gisLayerQueryOperators][gisIntersects],
@@ -17,14 +16,14 @@ let
         {"Name", "shape", "description"},
         {
             {"ZoneA",
-             gisShapeCreateFromWKT("POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))"),
+             "POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))",
              "Main zone A area"},
             {"ZoneB",
-             gisShapeCreateFromWKT("POLYGON((10 0, 10 10, 20 10, 20 0, 10 0))"),
+             "POLYGON((10 0, 10 10, 20 10, 20 0, 10 0))",
              "Main zone B area"}
         }
     ),
-    LayerA = gisLayerCreateFromTable(TableA, "shape"),
+    LayerA = gisLayerCreateFromTableWithWKT(TableA, "shape"),
 
     //---------------------------------------
     // 2️⃣  Sub‑zones (LayerB) – with descriptions
@@ -33,17 +32,17 @@ let
         {"SubName", "shape", "description"},
         {
             {"Sub1",
-             gisShapeCreateFromWKT("POLYGON((2 2, 2 4, 4 4, 4 2, 2 2))"),
+             "POLYGON((2 2, 2 4, 4 4, 4 2, 2 2))",
              "Inside ZoneA"},
             {"Sub2",
-             gisShapeCreateFromWKT("POLYGON((9 2, 9 8, 12 8, 12 2, 9 2))"),
-             "Overlaps Zones A and B"},
+             "POLYGON((9 2, 9 8, 12 8, 12 2, 9 2))",
+             "Overlaps Zones A and B"},
             {"Sub3",
-             gisShapeCreateFromWKT("POLYGON((22 2, 22 8, 24 8, 24 2, 22 2))"),
+             "POLYGON((22 2, 22 8, 24 8, 24 2, 22 2))",
              "Outside both zones"}
         }
     ),
-    LayerB = gisLayerCreateFromTable(TableB, "shape"),
+    LayerB = gisLayerCreateFromTableWithWKT(TableB, "shape"),
 
     //---------------------------------------
     // 3️⃣  Intersects

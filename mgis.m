@@ -786,6 +786,22 @@ let
         type function (layer as TLayer, operator as TRowQueryOperator) as TLayer
     ),
 
+    //Create a layer from a table with a WKT column
+    //@param tbl - The table to create the layer from
+    //@param wktColumn - The column that contains WKT text
+    //@return The created layer, the table of which has the same columns as the original table, with the WKT column transformed to TShape objects.
+    LayerCreateFromTableWithWKT = Value.ReplaceType(
+        (tbl as table, wktColumn as text) as record => (
+            let
+                _ = if not Table.HasColumns(tbl, {wktColumn}) then error "Table does not have a column named " & wktColumn & "." else null,
+                tblWithShapes = Table.TransformColumns(tbl, {{wktColumn, each ShapeCreateFromWKT(_), type record}}),
+                layer = LayerCreateFromTable(tblWithShapes, wktColumn)
+            in
+                layer
+        ),
+        type function (tbl as table, wktColumn as text) as TLayer
+    ),
+
     //Join two layers together based on a spatial relationship
     //@param layer1 - The first layer to join
     //@param layer2 - The second layer to join
@@ -1081,6 +1097,7 @@ in
         gisShapeCreateFromWKT = ShapeCreateFromWKT,
         gisLayerCreateBlank = LayerCreateBlank,
         gisLayerCreateFromTable = LayerCreateFromTable,
+        gisLayerCreateFromTableWithWKT = LayerCreateFromTableWithWKT,
         gisLayerQuerySpatial = LayerQuerySpatial,
         gisLayerQueryRelational = LayerQueryRelational,
         gisLayerQueryOperators = [

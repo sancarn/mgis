@@ -3,8 +3,7 @@ let
     GISLib = mgis,
 
     // --- Shortcuts ---
-    gisShapeCreateFromWKT   = GISLib[gisShapeCreateFromWKT],
-    gisLayerCreateFromTable = GISLib[gisLayerCreateFromTable],
+    gisLayerCreateFromTableWithWKT = GISLib[gisLayerCreateFromTableWithWKT],
     gisLayerJoinSpatial     = GISLib[gisLayerJoinSpatial],
     gisNearest             = GISLib[gisLayerQueryOperators][gisNearest],
 
@@ -15,14 +14,14 @@ let
         #table(
             {"HouseID", "shape"},
             {
-                {"H1", gisShapeCreateFromWKT("POINT(1 1)")},
-                {"H2", gisShapeCreateFromWKT("POINT(4 3)")},
-                {"H3", gisShapeCreateFromWKT("POINT(9 6)")},
-                {"H4", gisShapeCreateFromWKT("POINT(14 3)")},
-                {"H5", gisShapeCreateFromWKT("POINT(18 8)")}
+                {"H1", "POINT(1 1)"},
+                {"H2", "POINT(4 3)"},
+                {"H3", "POINT(9 6)"},
+                {"H4", "POINT(14 3)"},
+                {"H5", "POINT(18 8)"}
             }
         ),
-    HousesLayer = gisLayerCreateFromTable(HousesTable, "shape"),
+    HousesLayer = gisLayerCreateFromTableWithWKT(HousesTable, "shape"),
 
     //-------------------------------------
     // 🏪  Layer B: Shops (points)
@@ -31,14 +30,14 @@ let
         #table(
             {"ShopID", "shape"},
             {
-                {"S1", gisShapeCreateFromWKT("POINT(0 0)")},
-                {"S2", gisShapeCreateFromWKT("POINT(5 2)")},
-                {"S3", gisShapeCreateFromWKT("POINT(10 6)")},
-                {"S4", gisShapeCreateFromWKT("POINT(15 3)")},
-                {"S5", gisShapeCreateFromWKT("POINT(20 10)")}
+                {"S1", "POINT(0 0)"},
+                {"S2", "POINT(5 2)"},
+                {"S3", "POINT(10 6)"},
+                {"S4", "POINT(15 3)"},
+                {"S5", "POINT(20 10)"}
             }
         ),
-    ShopsLayer = gisLayerCreateFromTable(ShopsTable, "shape"),
+    ShopsLayer = gisLayerCreateFromTableWithWKT(ShopsTable, "shape"),
 
     //-------------------------------------
     // 🔍  Perform nearest‑neighbour join
