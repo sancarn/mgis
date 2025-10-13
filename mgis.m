@@ -220,7 +220,19 @@ let
         geometryColumn = text,
         queryLayer = TQuadTree
     ],
-    TQuadTreeQueryOperator = type function (candidate as TShape, q as TShape) as logical,
+    TQuadTreeQueryOperator = type [
+        // Required: per‑candidate callback
+        onCandidate = function (candidate as TShape, query as TShape) as any,
+
+        // Optional: aggregate child/node results
+        combine = nullable function (childResults as list) as any,
+
+        // Optional: early‑exit / pruning rule
+        continueSearch = nullable function (currentBest as any) as logical,
+
+        // Optional: additional columns that should be present in results
+        additionalColumns = nullable {text}
+    ],
     TRowQueryOperator = type function (candidate as record) as logical,
     QuadTreeBoxesIntersect = Value.ReplaceType(
         (b1 as record, b2 as record) as logical => (
@@ -423,75 +435,198 @@ let
         type function (quadTree as TQuadTree, shape as TShape) as TQuadTree
     ),
 
-    QuadTreeOperatorIntersect = Value.ReplaceType(
-        (candidate as record, q as record) as logical => (
+    //Candidate envelope intersects query envelope
+    QuadTreeOperatorIntersect = Value.ReplaceType([
+        onCandidate = (candidate as record, query as record) as list =>
             let
                 _ = if not Record.HasFields(candidate, {"__TShapeIdentifier__"}) then error "Candidate is not a TShape" else null,
-                _2 = if not Record.HasFields(q, {"__TShapeIdentifier__"}) then error "Query is not a TShape" else null,
-                result = QuadTreeBoxesIntersect(candidate[Envelope], q[Envelope])
+                _2 = if not Record.HasFields(query, {"__TShapeIdentifier__"}) then error "Query is not a TShape" else null,
+                a = candidate[Envelope],
+                b = query[Envelope],
+                intersects =
+                    not (
+                        a[MaxX] < b[MinX] or
+                        a[MinX] > b[MaxX] or
+                        a[MaxY] < b[MinY] or
+                        a[MinY] > b[MaxY]
+                    )
             in
-                result
-        ),
+                if intersects then { [shape=candidate] } else {},
+            combine = null,
+            continueSearch = null,
+            additionalColumns = null
+        ],
         TQuadTreeQueryOperator
     ),
 
+    //Candidate envelope fully contains query envelope
     QuadTreeOperatorContains = Value.ReplaceType(
-        (candidate as record, q as record) as logical => (
-            let
-                _ = if not Record.HasFields(candidate, {"__TShapeIdentifier__"}) then error "Candidate is not a TShape" else null,
-                _2 = if not Record.HasFields(q, {"__TShapeIdentifier__"}) then error "Query is not a TShape" else null,
-                p = candidate[Envelope],
-                t = q[Envelope]
-            in
-                (t[MinX] >= p[MinX]) and (t[MaxX] <= p[MaxX]) and (t[MinY] >= p[MinY]) and (t[MaxY] <= p[MaxY])
-        ),
+        [
+            onCandidate = (candidate as record, query as record) as list =>
+                let
+                    _ = if not Record.HasFields(candidate, {"__TShapeIdentifier__"}) then error "Candidate is not a TShape" else null,
+                    _2 = if not Record.HasFields(query, {"__TShapeIdentifier__"}) then error "Query is not a TShape" else null,
+                    p = candidate[Envelope],
+                    t = query[Envelope],
+                    contains =
+                        (t[MinX] >= p[MinX]) and (t[MaxX] <= p[MaxX]) and
+                        (t[MinY] >= p[MinY]) and (t[MaxY] <= p[MaxY])
+                in
+                    if contains then { [shape=candidate] } else {},
+            combine = null,
+            continueSearch = null,
+            additionalColumns = null
+        ],
         TQuadTreeQueryOperator
+    ),
+    
+    //Candidate envelope fully inside query envelope
+	QuadTreeOperatorWithin = Value.ReplaceType(
+	    [
+	        onCandidate = (candidate as record, query as record) as list =>
+	            let
+                    _ = if not Record.HasFields(candidate, {"__TShapeIdentifier__"}) then error "Candidate is not a TShape" else null,
+                    _2 = if not Record.HasFields(query, {"__TShapeIdentifier__"}) then error "Query is not a TShape" else null,
+	                p = query[Envelope],
+	                t = candidate[Envelope],
+	                within =
+	                    (t[MinX] >= p[MinX]) and (t[MaxX] <= p[MaxX]) and
+	                    (t[MinY] >= p[MinY]) and (t[MaxY] <= p[MaxY])
+	            in
+	                if within then { [shape=candidate] } else {},
+	        combine = null,
+	        continueSearch = null,
+	        additionalColumns = null
+	    ],
+	    TQuadTreeQueryOperator
+	),
+
+    //Nearest neighbor
+    QuadTreeOperatorNearestN = Value.ReplaceType(
+        (k as number) as record =>
+            [
+                onCandidate = (candidate as record, query as record) as record =>
+                    let
+                        _ = if not Record.HasFields(candidate, {"__TShapeIdentifier__"}) then error "Candidate is not a TShape" else null,
+                        _2 = if not Record.HasFields(query, {"__TShapeIdentifier__"}) then error "Query is not a TShape" else null,
+                        e1  = candidate[Envelope],
+                        e2  = query[Envelope],
+                        cx1 = (e1[MinX] + e1[MaxX]) / 2,
+                        cy1 = (e1[MinY] + e1[MaxY]) / 2,
+                        cx2 = (e2[MinX] + e2[MaxX]) / 2,
+                        cy2 = (e2[MinY] + e2[MaxY]) / 2,
+                        dist = Number.Sqrt((cx1 - cx2)*(cx1 - cx2) + (cy1 - cy2)*(cy1 - cy2))
+                    in
+                        [ shape = candidate, dist = dist ],
+
+                combine = (lists as list) as list =>
+                    let
+                        all   = List.Combine(lists),
+                        sorted = List.Sort(all, each _[dist]),
+                        bestN  = List.FirstN(sorted, k)
+                    in
+                        bestN,
+
+                continueSearch = (partial as any) as logical => 
+                    // stop when we already collected exactly k = 1 neighbours with dist = 0
+                    if Value.Is(partial, type list) and List.Count(partial) = k then false else true,
+
+                additionalColumns = {"dist"}
+            ],
+            type function (k as number) as TQuadTreeQueryOperator
     ),
 
-    QuadTreeOperatorWithin = Value.ReplaceType(
-        (candidate as record, q as record) as logical => (
-            let
-                _ = if not Record.HasFields(candidate, {"__TShapeIdentifier__"}) then error "Candidate is not a TShape" else null,
-                _2 = if not Record.HasFields(q, {"__TShapeIdentifier__"}) then error "Query is not a TShape" else null,
-                p = q[Envelope],
-                t = candidate[Envelope]
-            in
-                (t[MinX] >= p[MinX]) and (t[MaxX] <= p[MaxX]) and (t[MinY] >= p[MinY]) and (t[MaxY] <= p[MaxY])
-        ),
-        TQuadTreeQueryOperator
-    ),
+    //Nearest neighbor
+    QuadTreeOperatorNearest = QuadTreeOperatorNearestN(1),
+
+    NormalizeList = (value as any) as list =>
+        if value = null then
+            {}
+        else if Value.Is(value, type list) then
+            value
+        else
+            { value },
+
+    // Ensure all records have the same schema by adding missing columns as null
+    NormalizeRecords = (records as list, additionalColumns as nullable list) as list =>
+        if additionalColumns = null or List.Count(additionalColumns) = 0 then
+            records
+        else
+            List.Transform(
+                records,
+                (r as record) as record =>
+                    let
+                        existingFields = Record.FieldNames(r),
+                        missingFields = List.RemoveItems(additionalColumns, existingFields),
+                        nullFields = List.Transform(missingFields, each [Name = _, Value = null]),
+                        additionalRecord = Record.FromList(List.Transform(nullFields, each _[Value]), List.Transform(nullFields, each _[Name]))
+                    in
+                        Record.Combine({r, additionalRecord})
+            ),
+
+    //Query a node based on a spatial relationship to a supplied shape
     QuadTreeNodeQuery = Value.ReplaceType(
-        (node as record, shape as record, callback as function) as list => (
+        (node as record, shape as record, operator as record) as any =>
             let
-                _ = if not Record.HasFields(shape, {"__TShapeIdentifier__"}) then error "Shape is not a TShape" else null,
+                _ = if not Record.HasFields(shape, {"__TShapeIdentifier__"})
+                        then error "Shape is not a TShape"
+                        else null,
+
+                onCandidate    = operator[onCandidate],
+                combine        = if operator[combine] <> null
+                                    then operator[combine]
+                                    else List.Combine,
+                continueSearch = if operator[continueSearch] <> null
+                                    then operator[continueSearch]
+                                    else (x as any) => true,
+
                 queryEnvelope = shape[Envelope],
-                nodeEnvelope = node[envelope],
-                // prune by envelope intersection
+                nodeEnvelope  = node[envelope],
                 nodeIntersects = QuadTreeBoxesIntersect(nodeEnvelope, queryEnvelope),
 
-                // test shapes at this node
-                fromNode = if nodeIntersects then List.Select(node[shapes], each callback(_, shape)) else {},
+                //------------------------------------------
+                // Candidate results at this node
+                //------------------------------------------
+                fromNodeRaw =
+                    if nodeIntersects
+                        then List.Transform(node[shapes], each onCandidate(_, shape))
+                        else {},
+                fromNode = NormalizeList(List.Combine(List.Transform(fromNodeRaw, each NormalizeList(_)))),
 
-                // recurse into children that intersect
-                fromChildren = if nodeIntersects and node[children] <> null then
-                    let
-                        kids = node[children],
-                        lists = List.Transform(kids, (c as record) as list => if QuadTreeBoxesIntersect(c[envelope], queryEnvelope) then @QuadTreeNodeQuery(c, shape, callback) else {})
-                    in
-                        List.Combine(lists)
-                else
-                    {}
+                //------------------------------------------
+                // Recurse into children
+                //------------------------------------------
+                fromChildrenRaw =
+                    if nodeIntersects and node[children] <> null and continueSearch(fromNode)
+                        then List.Transform(
+                                node[children],
+                                (c as record) =>
+                                    if QuadTreeBoxesIntersect(c[envelope], queryEnvelope)
+                                        then @QuadTreeNodeQuery(c, shape, operator)
+                                        else {})
+                        else {},
+                fromChildren = NormalizeList(List.Combine(List.Transform(fromChildrenRaw, each NormalizeList(_)))),
+
+                //------------------------------------------
+                // Combine results safely
+                //------------------------------------------
+                result = combine({ fromNode, fromChildren })
             in
-                fromNode & fromChildren
-        ),
-        type function (node as TQuadTreeNode, shape as TShape, callback as function) as list
+                result,
+
+        type function (node as TQuadTreeNode, shape as TShape, operator as TQuadTreeQueryOperator) as any
     ),
-    QuadTreeQuery = Value.ReplaceType(
-        (quadTree as record, shape as record, callback as function) as list => (
-            QuadTreeNodeQuery(quadTree[root], shape, callback)
-        ),
-        type function (quadTree as TQuadTree, shape as TShape, operator as TQuadTreeQueryOperator) as list
+    
+	QuadTreeQuery = Value.ReplaceType(
+        (qt as record, shape as record, op as record) as list =>
+            let
+                res = QuadTreeNodeQuery(qt[root], shape, op),
+                listOut = NormalizeList(res)
+            in
+                listOut,
+        type function (qt as TQuadTree, shape as TShape, op as TQuadTreeQueryOperator) as list
     ),
+
     QuadTreeNodePrune = Value.ReplaceType(
         (node as record, ids as list) as record => (
             let
@@ -660,10 +795,10 @@ let
     //                  Remark: Supported types are "Inner", "Left Outer", "Right Outer", "Full Outer"
     //@return The joined layer, the table of which has 4 columns: __rowid__, layer1, layer2, shape. Where layer1 and layer2 are the row objects from the original layers, and shape is the shape of the row from the original layer.
     LayerJoinSpatial = Value.ReplaceType(
-        (layer1 as record, layer2 as record, gisOperator as nullable function, joinType as nullable text) as record => (
+        (layer1 as record, layer2 as record, gisOperator as nullable record, joinType as nullable text) as record => (
             let
                 actualJoinType = joinType ?? "Inner",
-                actualGisOperator = gisOperator ?? QuadTreeOperatorIntersect,
+                actualGisOperator = gisOperator ?? [onCandidate = QuadTreeOperatorIntersect],
                 table1 = layer1[table],
                 table2 = layer2[table],
                 geomCol1 = layer1[geometryColumn],
@@ -676,13 +811,14 @@ let
                         let
                             shape1 = Record.Field(r1, geomCol1),
                             matchingShapes = QuadTreeQuery(layer2[queryLayer], shape1, actualGisOperator),
-                            matchingIds = List.Transform(
-                                List.Select(matchingShapes, each Record.HasFields(_, "__rowid__") and (Record.Field(_, "__rowid__") <> null)),
-                                each Record.Field(_, "__rowid__")
-                            ),
+                            matchingIds =
+                                List.Transform(
+                                    matchingShapes,
+                                    each _[shape][__rowid__]
+                                ),
                             matchingRows = Table.SelectRows(table2, (r2 as record) as logical => List.Contains(matchingIds, Record.Field(r2, "__rowid__")))
                         in
-                            [row1 = r1, matchingRows = matchingRows, shape1 = shape1]
+                            [row1 = r1, matchingRows = matchingRows, matchingShapes = matchingShapes, shape1 = shape1]
                     )
                 ),
                 
@@ -693,145 +829,222 @@ let
                         List.Combine(
                             List.Transform(
                                 layer1Matches,
-                                (match as record) as list => (
+                                (match as record) as list =>
                                     let
                                         r1 = match[row1],
-                                        matches = Table.ToRecords(match[matchingRows])
+                                        matches = Table.ToRecords(match[matchingRows]),
+                                        shapes = match[matchingShapes]
                                     in
                                         if List.Count(matches) > 0 then
-                                            List.Transform(matches, (r2 as record) as record => [
-                                                layer1 = r1,
-                                                layer2 = r2,
-                                                shape = match[shape1]
-                                            ])
+                                            List.Transform(
+                                                matches,
+                                                (r2 as record) as record =>
+                                                    let
+                                                        r2id = r2[__rowid__],
+                                                        shapeData = if List.Count(shapes) > 0 then List.First(List.Select(shapes, each _[shape][__rowid__] = r2id)) else null,
+                                                        shapeExtras = if shapeData <> null then Record.RemoveFields(shapeData, {"shape"}) else [],
+                                                        actualShape = if shapeData <> null then shapeData[shape] else null
+                                                    in
+                                                        Record.Combine({
+                                                            [ 
+                                                                layer1 = r1,
+                                                                layer2 = r2,
+                                                                shape  = actualShape
+                                                            ],
+                                                            shapeExtras
+                                                        })
+                                            )
                                         else
                                             {}
-                                )
                             )
                         )
+
                     else if actualJoinType = "Left Outer" then
                         // Left Outer: all rows from layer1
                         List.Combine(
                             List.Transform(
                                 layer1Matches,
-                                (match as record) as list => (
+                                (match as record) as list =>
                                     let
                                         r1 = match[row1],
-                                        matches = Table.ToRecords(match[matchingRows])
+                                        matches = Table.ToRecords(match[matchingRows]),
+                                        shapes = match[matchingShapes]
                                     in
                                         if List.Count(matches) > 0 then
-                                            List.Transform(matches, (r2 as record) as record => [
-                                                layer1 = r1,
-                                                layer2 = r2,
-                                                shape = match[shape1]
-                                            ])
+                                            List.Transform(
+                                                matches,
+                                                (r2 as record) as record =>
+                                                    let
+                                                        r2id = r2[__rowid__],
+                                                        shapeData = if List.Count(shapes) > 0 then List.First(List.Select(shapes, each _[shape][__rowid__] = r2id)) else null,
+                                                        shapeExtras = if shapeData <> null then Record.RemoveFields(shapeData, {"shape"}) else [],
+                                                        actualShape = if shapeData <> null then shapeData[shape] else null
+                                                    in
+                                                        Record.Combine({
+                                                            [ 
+                                                                layer1 = r1,
+                                                                layer2 = r2,
+                                                                shape  = actualShape
+                                                            ],
+                                                            shapeExtras
+                                                        })
+                                            )
                                         else
-                                            {[
-                                                layer1 = r1,
-                                                layer2 = null,
-                                                shape = match[shape1]
-                                            ]}
-                                )
+                                            {
+                                                [ 
+                                                    layer1 = r1,
+                                                    layer2 = null,
+                                                    shape  = match[shape1]
+                                                ]
+                                            }
                             )
                         )
+
                     else if actualJoinType = "Right Outer" then
                         // Right Outer: all rows from layer2
                         let
-                            // Get all layer2 rowids that were matched
-                            matchedLayer2Ids = List.Distinct(
+                            matchedLayer2Ids =
+                                List.Distinct(
+                                    List.Combine(
+                                        List.Transform(
+                                            layer1Matches,
+                                            (match as record) as list =>
+                                                Table.Column(match[matchingRows], "__rowid__")
+                                        )
+                                    )
+                                ),
+                            // Rows with matches
+                            matchedRows =
                                 List.Combine(
                                     List.Transform(
                                         layer1Matches,
-                                        (match as record) as list => (
-                                            Table.Column(match[matchingRows], "__rowid__")
-                                        )
+                                        (match as record) as list =>
+                                            let
+                                                r1 = match[row1],
+                                                matches = Table.ToRecords(match[matchingRows]),
+                                                shapes = match[matchingShapes]
+                                            in
+                                                List.Transform(
+                                                    matches,
+                                                    (r2 as record) as record =>
+                                                        let
+                                                            r2id = r2[__rowid__],
+                                                            shapeData = if List.Count(shapes) > 0 then List.First(List.Select(shapes, each _[shape][__rowid__] = r2id)) else null,
+                                                            shapeExtras = if shapeData <> null then Record.RemoveFields(shapeData, {"shape"}) else [],
+                                                            extras = Record.RemoveFields(r2, {"shape", "__rowid__"}),
+                                                            actualShape = if shapeData <> null then shapeData[shape] else null
+                                                        in
+                                                            Record.Combine({
+                                                                [ 
+                                                                    layer1 = r1,
+                                                                    layer2 = r2,
+                                                                    shape  = actualShape
+                                                                ],
+                                                                extras,
+                                                                shapeExtras
+                                                            })
+                                                )
                                     )
-                                )
-                            ),
-                            // Rows with matches
-                            matchedRows = List.Combine(
-                                List.Transform(
-                                    layer1Matches,
-                                    (match as record) as list => (
-                                        let
-                                            r1 = match[row1],
-                                            matches = Table.ToRecords(match[matchingRows])
-                                        in
-                                            List.Transform(matches, (r2 as record) as record => [
-                                                layer1 = r1,
-                                                layer2 = r2,
-                                                shape = Record.Field(r2, geomCol2)
-                                            ])
-                                    )
-                                )
-                            ),
+                                ),
                             // Unmatched rows from layer2
-                            unmatchedRows = List.Transform(
-                                Table.SelectRows(table2, (r2 as record) as logical => not List.Contains(matchedLayer2Ids, Record.Field(r2, "__rowid__"))),
-                                (r2 as record) as record => [
-                                    layer1 = null,
-                                    layer2 = r2,
-                                    shape = Record.Field(r2, geomCol2)
-                                ]
-                            )
+                            unmatchedRows =
+                                List.Transform(
+                                    Table.SelectRows(
+                                        table2,
+                                        (r2 as record) as logical =>
+                                            not List.Contains(matchedLayer2Ids, r2[__rowid__])
+                                    ),
+                                    (r2 as record) as record => [
+                                        layer1 = null,
+                                        layer2 = r2,
+                                        shape  = r2[geomCol2]
+                                    ]
+                                )
                         in
                             matchedRows & unmatchedRows
-                    else  if actualJoinType = "Full Outer" then
+
+                    else if actualJoinType = "Full Outer" then
                         let
-                            // Get all layer2 rowids that were matched
-                            matchedLayer2Ids = List.Distinct(
+                            matchedLayer2Ids =
+                                List.Distinct(
+                                    List.Combine(
+                                        List.Transform(
+                                            layer1Matches,
+                                            (match as record) as list =>
+                                                Table.Column(match[matchingRows], "__rowid__")
+                                        )
+                                    )
+                                ),
+                            layer1Results =
                                 List.Combine(
                                     List.Transform(
                                         layer1Matches,
-                                        (match as record) as list => (
-                                            Table.Column(match[matchingRows], "__rowid__")
-                                        )
+                                        (match as record) as list =>
+                                            let
+                                                r1 = match[row1],
+                                                matches = Table.ToRecords(match[matchingRows]),
+                                                shapes = match[matchingShapes]
+                                            in
+                                                if List.Count(matches) > 0 then
+                                                    List.Transform(
+                                                        matches,
+                                                        (r2 as record) as record =>
+                                                            let
+                                                                r2id = r2[__rowid__],
+                                                                shapeData = if List.Count(shapes) > 0 then List.First(List.Select(shapes, each _[shape][__rowid__] = r2id)) else null,
+                                                                shapeExtras = Record.RemoveFields(shapeData, {"shape"}),
+                                                                extras = Record.RemoveFields(r2, {"shape", "__rowid__"}),
+                                                                actualShape = shapeData[shape]
+                                                            in
+                                                                Record.Combine({
+                                                                    [ layer1 = r1,
+                                                                    layer2 = r2,
+                                                                    shape  = actualShape
+                                                                    ],
+                                                                    extras,
+                                                                    shapeExtras
+                                                                })
+                                                    )
+                                                else
+                                                    {
+                                                        [ layer1 = r1,
+                                                        layer2 = null,
+                                                        shape  = match[shape1]
+                                                        ]
+                                                    }
                                     )
-                                )
-                            ),
-                            // Rows with matches and layer1 without matches
-                            layer1Results = List.Combine(
+                                ),
+                            unmatchedLayer2 =
                                 List.Transform(
-                                    layer1Matches,
-                                    (match as record) as list => (
-                                        let
-                                            r1 = match[row1],
-                                            matches = Table.ToRecords(match[matchingRows])
-                                        in
-                                            if List.Count(matches) > 0 then
-                                                List.Transform(matches, (r2 as record) as record => [
-                                                    layer1 = r1,
-                                                    layer2 = r2,
-                                                    shape = match[shape1]
-                                                ])
-                                            else
-                                                {[
-                                                    layer1 = r1,
-                                                    layer2 = null,
-                                                    shape = match[shape1]
-                                                ]}
-                                    )
+                                    Table.SelectRows(
+                                        table2,
+                                        (r2 as record) as logical =>
+                                            not List.Contains(matchedLayer2Ids, r2[__rowid__])
+                                    ),
+                                    (r2 as record) as record => [
+                                        layer1 = null,
+                                        layer2 = r2,
+                                        shape  = r2[geomCol2]
+                                    ]
                                 )
-                            ),
-                            // Unmatched rows from layer2
-                            unmatchedLayer2 = List.Transform(
-                                Table.SelectRows(table2, (r2 as record) as logical => not List.Contains(matchedLayer2Ids, Record.Field(r2, "__rowid__"))),
-                                (r2 as record) as record => [
-                                    layer1 = null,
-                                    layer2 = r2,
-                                    shape = Record.Field(r2, geomCol2)
-                                ]
-                            )
                         in
                             layer1Results & unmatchedLayer2
+
                     else
                         error "Invalid join type"
                 ),
 
+                // Normalize records to ensure consistent schema
+                normalizedRows = NormalizeRecords(resultRows, actualGisOperator[additionalColumns]),
+                
                 // Create result table with __rowid__ column
-                resultTable0 = Table.FromRecords(resultRows, type table [layer1 = any, layer2 = any, shape = any]),
+                resultTable0 = Table.FromRecords(normalizedRows),
                 resultTable = Table.AddIndexColumn(resultTable0, "__rowid__", 0, 1, Int64.Type),
-                resultTableReordered = Table.ReorderColumns(resultTable, {"__rowid__", "layer1", "layer2", "shape"}),
+                baseColumns = {"__rowid__", "layer1", "layer2", "shape"},
+                allColumns = Table.ColumnNames(resultTable),
+                extraColumns = List.RemoveItems(allColumns, baseColumns),
+                columnOrder = baseColumns & extraColumns,
+                resultTableReordered = Table.ReorderColumns(resultTable, columnOrder),
                 
                 // Build quadtree for the result
                 qtCapacity = if List.Count(resultRows) > 100 then List.Count(resultRows) / 10 else 10,
@@ -842,7 +1055,14 @@ let
                         let
                             s = r[shape],
                             sid = r[__rowid__],
-                            s2 = if Record.HasFields(s, "__rowid__") then Record.TransformFields(s, {"__rowid__", each sid}) else Record.AddField(s, "__rowid__", sid)
+                            s2 = 
+                                if Record.HasFields(s, "__rowid__") then 
+                                    Record.TransformFields(s, {"__rowid__", each sid}) 
+                                else 
+                                    if sid <> null then
+                                        Record.AddField(s, "__rowid__", sid)
+                                    else
+                                        s
                         in
                             s2
                 ),
@@ -867,7 +1087,9 @@ in
             gisIntersects = QuadTreeOperatorIntersect,
             gisContains = QuadTreeOperatorContains,
             gisWithin = QuadTreeOperatorWithin,
-            gisQueryOperatorType = TQuadTreeQueryOperator //Provided for custom operators
+            gisQueryOperatorType = TQuadTreeQueryOperator, //Provided for custom operators
+            gisNearestN = QuadTreeOperatorNearestN,
+            gisNearest = QuadTreeOperatorNearest
         ],
 		gisLayerInsertRows = LayerInsertRows,
 		gisLayerJoinSpatial = LayerJoinSpatial
