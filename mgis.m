@@ -43,6 +43,8 @@ let
         MaxY = number
     ],
     TShape = type [
+        //To ensure this is a TShape, not some other record, we add this field. It won't be used for any other purpose. Just a sanity check.
+        __TShapeIdentifier__ = null,
         //Kind as "POINT" | "LINESTRING" | "POLYGON" | "MULTIPOINT" | "MULTILINESTRING" | "MULTIPOLYGON" | "GEOMETRYCOLLECTION"
         Kind = text,
         //Geometry as TBasePoint | TBaseLineString | TBasePolygon | TBaseMultiPoint | TBaseMultiLineString | TBaseMultiPolygon | TBaseGeometryCollection
@@ -155,12 +157,27 @@ let
         in
             Record.Field(switch, geometry[Kind])(geometry)
     ),
+    ShapeCreatePointFromLatLng = Value.ReplaceType(
+        (lat as number, lng as number) as record => (
+            let
+                baseGeometry = GeometryPoint.From(lng, lat)
+            in [
+                __TShapeIdentifier__ = null,
+                Kind = baseGeometry[Kind],
+                Geometry = baseGeometry,
+                Envelope = privGetEnvelope(baseGeometry),
+                __rowid__ = null
+            ]
+        ),
+        type function (lat as number, lng as number) as TShape
+    ),
     ShapeCreateFromWKT = Value.ReplaceType(
         (wkt as text) as record => (
             let 
                 baseGeometry = Geometry.FromWellKnownText(wkt),
                 envelope = privGetEnvelope(baseGeometry)
             in [
+                __TShapeIdentifier__ = null,
                 Kind = baseGeometry[Kind],
                 Geometry = baseGeometry,
                 Envelope = envelope,
@@ -232,8 +249,11 @@ let
                     // NW
                     [envelope = [MinX = b[MinX], MinY = midY, MaxX = midX, MaxY = b[MaxY]], capacity = node[capacity], shapes = {}, children = null]
                 }
-            in 
-                Record.AddField(node, "children", children)
+            in                
+                if Record.HasFields(node, {"children"}) then
+                    Record.TransformFields(node, {"children", each children})
+                else
+                    Record.AddField(node, "children", children)
         ),
         type function (node as TQuadTreeNode) as TQuadTreeNode
     ),
@@ -259,6 +279,7 @@ let
     QuadTreeNodeInsert = Value.ReplaceType(
         (node as record, shape as record, isRoot as logical) as record => (
             let
+                _ = if not Record.HasFields(shape, {"__TShapeIdentifier__"}) then error "Shape is not a TShape" else null,
                 bNode = node[envelope],
                 bShape = shape[Envelope],
                 intersects = QuadTreeBoxesIntersect(bNode, bShape),
@@ -393,6 +414,7 @@ let
     QuadTreeInsert = Value.ReplaceType(
         (quadTree as record, shape as record) as record => (
             let
+                _ = if not Record.HasFields(shape, {"__TShapeIdentifier__"}) then error "Shape is not a TShape" else null,
                 result = QuadTreeNodeInsert(quadTree[root], shape, true),
                 updatedRoot = Record.TransformFields(quadTree, {"root", each result})
             in
@@ -403,7 +425,12 @@ let
 
     QuadTreeOperatorIntersect = Value.ReplaceType(
         (candidate as record, q as record) as logical => (
-            QuadTreeBoxesIntersect(candidate[Envelope], q[Envelope])
+            let
+                _ = if not Record.HasFields(candidate, {"__TShapeIdentifier__"}) then error "Candidate is not a TShape" else null,
+                _2 = if not Record.HasFields(q, {"__TShapeIdentifier__"}) then error "Query is not a TShape" else null,
+                result = QuadTreeBoxesIntersect(candidate[Envelope], q[Envelope])
+            in
+                result
         ),
         TQuadTreeQueryOperator
     ),
@@ -411,6 +438,8 @@ let
     QuadTreeOperatorContains = Value.ReplaceType(
         (candidate as record, q as record) as logical => (
             let
+                _ = if not Record.HasFields(candidate, {"__TShapeIdentifier__"}) then error "Candidate is not a TShape" else null,
+                _2 = if not Record.HasFields(q, {"__TShapeIdentifier__"}) then error "Query is not a TShape" else null,
                 p = candidate[Envelope],
                 t = q[Envelope]
             in
@@ -422,6 +451,8 @@ let
     QuadTreeOperatorWithin = Value.ReplaceType(
         (candidate as record, q as record) as logical => (
             let
+                _ = if not Record.HasFields(candidate, {"__TShapeIdentifier__"}) then error "Candidate is not a TShape" else null,
+                _2 = if not Record.HasFields(q, {"__TShapeIdentifier__"}) then error "Query is not a TShape" else null,
                 p = q[Envelope],
                 t = candidate[Envelope]
             in
@@ -432,15 +463,11 @@ let
     QuadTreeNodeQuery = Value.ReplaceType(
         (node as record, shape as record, callback as function) as list => (
             let
+                _ = if not Record.HasFields(shape, {"__TShapeIdentifier__"}) then error "Shape is not a TShape" else null,
                 queryEnvelope = shape[Envelope],
                 nodeEnvelope = node[envelope],
                 // prune by envelope intersection
                 nodeIntersects = QuadTreeBoxesIntersect(nodeEnvelope, queryEnvelope),
-
-                // envelope helpers
-                envContains = (p as record, t as record) as logical =>
-                    (t[MinX] >= p[MinX]) and (t[MaxX] <= p[MaxX]) and (t[MinY] >= p[MinY]) and (t[MaxY] <= p[MaxY]),
-                envWithin = (x as record, y as record) as logical => @envContains(y, x),
 
                 // test shapes at this node
                 fromNode = if nodeIntersects then List.Select(node[shapes], each callback(_, shape)) else {},
@@ -476,6 +503,11 @@ let
         ),
         type function (node as TQuadTreeNode, ids as list) as TQuadTreeNode
     ),
+
+    //Create a blank layer
+    //@param geometryColumn - The column that should contain the geometry
+    //@param capacity - The capacity of the quadtree
+    //@return The created layer, the table of which has the same columns as the original table.
     LayerCreateBlank = Value.ReplaceType(
         (geometryColumn as nullable text, capacity as nullable number) as record => (
             let
@@ -490,9 +522,16 @@ let
         ),
         type function (geometryColumn as nullable text, capacity as nullable number) as TLayer
     ),
+
+    //Create a layer from a table
+    //@param tbl - The table to create the layer from
+    //@param geometryColumn - The column that contains the geometry
+    //@return The created layer, the table of which has the same columns as the original table.
     LayerCreateFromTable = Value.ReplaceType(
         (tbl as table, geometryColumn as text) as record => (
             let
+                _ = if not Table.HasColumns(tbl, {geometryColumn}) then error "Table does not have the geometry column. Please create the column with the relevant `gisShapeCreateFrom...` functions." else null,
+                _2 = if not Table.MatchesAllRows(tbl, each Record.HasFields(_, {"__TShapeIdentifier__"})) then error "Table geometry column does not contain `TShape`s. Please recreate the column with the relevant `gisShapeCreateFrom...` functions." else null,
                 tblWithId = EnsureRowIdColumn(tbl),
                 qtCapacity = Table.RowCount(tblWithId) / 10,
                 qt = QuadTreeCreate(qtCapacity, null),
@@ -516,6 +555,11 @@ let
         ),
         type function (tbl as table, geometryColumn as text) as TLayer
     ),
+
+    //Insert rows into a layer
+    //@param layer - The layer to insert the rows into
+    //@param rows - The rows to insert
+    //@return The updated layer, the table of which has the same columns as the original layer.
 	LayerInsertRows = Value.ReplaceType(
 		(layer as record, rows as list) as record => (
 			let
@@ -557,6 +601,12 @@ let
 		),
 		type function (layer as TLayer, rows as list) as TLayer
 	),
+
+    //Query a layer based on a spatial relationship to a supplied shape
+    //@param layer - The layer to query
+    //@param shape - The shape to query against
+    //@param gisOperator - A function that takes two shapes and returns a logical value indicating if they meet the spatial relationship.
+    //@return The queried layer, the table of which has the same columns as the original layer.
     LayerQuerySpatial = Value.ReplaceType(
         (layer as record, shape as record, gisOperator as record) as record => (
             let
@@ -577,6 +627,11 @@ let
         ),
         type function (layer as TLayer, shape as TShape, gisOperator as TQuadTreeQueryOperator) as TLayer
     ),
+
+    //Query a layer based on a row-wise relational operator
+    //@param layer - The layer to query
+    //@param operator - The relational operator to use for the query.
+    //@return The queried layer, the table of which has the same columns as the original layer.
     LayerQueryRelational = Value.ReplaceType(
         (layer as record, operator as function) as record => (
             let
@@ -595,6 +650,15 @@ let
         ),
         type function (layer as TLayer, operator as TRowQueryOperator) as TLayer
     ),
+
+    //Join two layers together based on a spatial relationship
+    //@param layer1 - The first layer to join
+    //@param layer2 - The second layer to join
+    //@param gisOperator - The spatial relationship to use for the join. If not provided, the default is Intersect.
+    //                     Remark: Read like "(shapes of layer1) within (shapes of layer2)"
+    //@param joinType - The type of join to perform. If not provided, the default is "Inner".
+    //                  Remark: Supported types are "Inner", "Left Outer", "Right Outer", "Full Outer"
+    //@return The joined layer, the table of which has 4 columns: __rowid__, layer1, layer2, shape. Where layer1 and layer2 are the row objects from the original layers, and shape is the shape of the row from the original layer.
     LayerJoinSpatial = Value.ReplaceType(
         (layer1 as record, layer2 as record, gisOperator as nullable function, joinType as nullable text) as record => (
             let
