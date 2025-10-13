@@ -52,6 +52,10 @@ let
         Envelope = TShapeEnvelope,
         __rowid__ = nullable number
     ],
+    TProjection = type [
+        Name = text
+        //TODO: Add more projection properties
+    ],
     privGetEnvelope = (geometry as any) as record => (
         //Recursive switch statement based on geometry.Kind
         let 
@@ -218,7 +222,8 @@ let
     TLayer = type [
         table = table,
         geometryColumn = text,
-        queryLayer = TQuadTree
+        queryLayer = TQuadTree,
+        TProjection = nullable TProjection //TODO: Make this relevant
     ],
     TQuadTreeQueryOperator = type [
         // Required: per‑candidate callback
@@ -652,7 +657,8 @@ let
             [
                 table = tbl,
                 geometryColumn = geomCol,
-                queryLayer = QuadTreeCreate(capacity ?? 10, null)
+                queryLayer = QuadTreeCreate(capacity ?? 10, null),
+                TProjection = null
             ]
         ),
         type function (geometryColumn as nullable text, capacity as nullable number) as TLayer
@@ -685,7 +691,8 @@ let
                 [
                     table = tblWithId,
                     geometryColumn = geometryColumn,
-                    queryLayer = inserted
+                    queryLayer = inserted,
+                    TProjection = null
                 ]
         ),
         type function (tbl as table, geometryColumn as text) as TLayer
@@ -731,7 +738,8 @@ let
 				[
 					table = newTable,
 					geometryColumn = layer[geometryColumn],
-					queryLayer = qt1
+					queryLayer = qt1,
+					TProjection = layer[TProjection]
 				]
 		),
 		type function (layer as TLayer, rows as list) as TLayer
@@ -757,7 +765,8 @@ let
                 [
                     table = selected,
                     geometryColumn = layer[geometryColumn],
-                    queryLayer = filteredQuadTree
+                    queryLayer = filteredQuadTree,
+                    TProjection = layer[TProjection]
                 ]
         ),
         type function (layer as TLayer, shape as TShape, gisOperator as TQuadTreeQueryOperator) as TLayer
@@ -780,7 +789,8 @@ let
                 [
                     table = selected,
                     geometryColumn = layer[geometryColumn],
-                    queryLayer = filteredQuadTree
+                    queryLayer = filteredQuadTree,
+                    TProjection = layer[TProjection]
                 ]
         ),
         type function (layer as TLayer, operator as TRowQueryOperator) as TLayer
@@ -795,7 +805,8 @@ let
             let
                 _ = if not Table.HasColumns(tbl, {wktColumn}) then error "Table does not have a column named " & wktColumn & "." else null,
                 tblWithShapes = Table.TransformColumns(tbl, {{wktColumn, each ShapeCreateFromWKT(_), type record}}),
-                layer = LayerCreateFromTable(tblWithShapes, wktColumn)
+                layer = LayerCreateFromTable(tblWithShapes, wktColumn),
+                TProjection = null
             in
                 layer
         ),
@@ -813,6 +824,7 @@ let
     LayerJoinSpatial = Value.ReplaceType(
         (layer1 as record, layer2 as record, gisOperator as nullable record, joinType as nullable text) as record => (
             let
+                //TODO: Need to reproject layer 2 to layer 1's projection
                 actualJoinType = joinType ?? "Inner",
                 actualGisOperator = gisOperator ?? [onCandidate = QuadTreeOperatorIntersect],
                 table1 = layer1[table],
@@ -1087,7 +1099,8 @@ let
                 [
                     table = resultTableReordered,
                     geometryColumn = "shape",
-                    queryLayer = inserted
+                    queryLayer = inserted,
+                    TProjection = layer1[TProjection]
                 ]
         ),
         type function (layer1 as TLayer, layer2 as TLayer, gisOperator as nullable TQuadTreeQueryOperator, joinType as nullable text) as TLayer
