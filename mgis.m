@@ -210,6 +210,10 @@ let
         in
             withId
     ),
+
+    //**************************************************
+    // Quadtree Implementation
+    //**************************************************
     TQuadTreeNode = type [
         //Shapes is where the actual shapes are stored. Sometimes a polygon or line may overlap multiple leaves,
         //we store these in the parent node's children list.
@@ -706,6 +710,10 @@ let
         type function (node as TQuadTreeNode, ids as list) as TQuadTreeNode
     ),
 
+    //**************************************************
+    // GIS Layer Implementation (wrapper for quadtree and record data)
+    //**************************************************
+
     //Creates a blank layer with no data
     //@param geometryColumn - The column name that should contain the geometry (default: "shape")
     //@param capacity - The capacity of the quadtree (default: 10)
@@ -759,6 +767,23 @@ let
                 ]
         ),
         type function (tbl as table, geometryColumn as text) as TLayer
+    ),
+
+    //Creates a layer from a table with a Well-Known Text (WKT) geometry column
+    //@param tbl - The table to create the layer from
+    //@param wktColumn - The column name that contains WKT text
+    //@returns - The created layer with WKT column transformed to TShape objects
+    LayerCreateFromTableWithWKT = Value.ReplaceType(
+        (tbl as table, wktColumn as text) as record => (
+            let
+                _ = if not Table.HasColumns(tbl, {wktColumn}) then error "Table does not have a column named " & wktColumn & "." else null,
+                tblWithShapes = Table.TransformColumns(tbl, {{wktColumn, each ShapeCreateFromWKT(_), type record}}),
+                layer = LayerCreateFromTable(tblWithShapes, wktColumn),
+                TProjection = null
+            in
+                layer
+        ),
+        type function (tbl as table, wktColumn as text) as TLayer
     ),
 
     //Inserts rows into a layer and updates the spatial index
@@ -861,22 +886,7 @@ let
         type function (layer as TLayer, operator as TRowQueryOperator) as TLayer
     ),
 
-    //Creates a layer from a table with a Well-Known Text (WKT) geometry column
-    //@param tbl - The table to create the layer from
-    //@param wktColumn - The column name that contains WKT text
-    //@returns - The created layer with WKT column transformed to TShape objects
-    LayerCreateFromTableWithWKT = Value.ReplaceType(
-        (tbl as table, wktColumn as text) as record => (
-            let
-                _ = if not Table.HasColumns(tbl, {wktColumn}) then error "Table does not have a column named " & wktColumn & "." else null,
-                tblWithShapes = Table.TransformColumns(tbl, {{wktColumn, each ShapeCreateFromWKT(_), type record}}),
-                layer = LayerCreateFromTable(tblWithShapes, wktColumn),
-                TProjection = null
-            in
-                layer
-        ),
-        type function (tbl as table, wktColumn as text) as TLayer
-    ),
+
 
     //Join two layers together based on a spatial relationship
     //@param layer1 - The first layer to join
