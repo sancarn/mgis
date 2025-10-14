@@ -56,7 +56,10 @@ let
         Name = text
         //TODO: Add more projection properties
     ],
-    privGetEnvelope = (geometry as any) as record => (
+    //Calculates the bounding envelope (min/max X and Y) for any geometry type
+    //@param geometry as (TBasePoint | TBaseLineString | TBasePolygon | TBaseMultiPoint | TBaseMultiLineString | TBaseMultiPolygon | TBaseGeometryCollection) - The geometry object to calculate the envelope for
+    //@returns TShapeEnvelope - A record with MinX, MinY, MaxX, MaxY representing the bounding box
+    GeometryGetEnvelope = (geometry as any) as record => (
         //Recursive switch statement based on geometry.Kind
         let 
             envelopsToEnvelope = (envelopes as list) as record => (
@@ -82,7 +85,7 @@ let
                 LINESTRING = (geometry as record) => (
                     let
                         //Compute envelopes for each point recursively
-                        envelopes = List.Transform(geometry[Points], each @privGetEnvelope(_)),
+                        envelopes = List.Transform(geometry[Points], each @GeometryGetEnvelope(_)),
                         //Extract mins and maxs
                         envelope = envelopsToEnvelope(envelopes)
                     in [
@@ -95,7 +98,7 @@ let
                 POLYGON = (geometry as record) => (
                     let
                         //Compute envelopes for each ring recursively
-                        envelopes = List.Transform(geometry[Rings], each @privGetEnvelope(_)),
+                        envelopes = List.Transform(geometry[Rings], each @GeometryGetEnvelope(_)),
                         //Extract mins and maxs
                         envelope = envelopsToEnvelope(envelopes)
                     in [
@@ -108,7 +111,7 @@ let
                 MULTIPOINT = (geometry as record) => (
                     let
                         //Compute envelopes for each component recursively
-                        envelopes = List.Transform(geometry[Components], each @privGetEnvelope(_)),
+                        envelopes = List.Transform(geometry[Components], each @GeometryGetEnvelope(_)),
                         //Extract mins and maxs
                         envelope = envelopsToEnvelope(envelopes)
                     in [
@@ -121,7 +124,7 @@ let
                 MULTILINESTRING = (geometry as record) => (
                     let
                         //Compute envelopes for each component recursively
-                        envelopes = List.Transform(geometry[Components], each @privGetEnvelope(_)),
+                        envelopes = List.Transform(geometry[Components], each @GeometryGetEnvelope(_)),
                         //Extract mins and maxs
                         envelope = envelopsToEnvelope(envelopes)    
                     in [
@@ -134,7 +137,7 @@ let
                 MULTIPOLYGON = (geometry as record) => (
                     let
                         //Compute envelopes for each component recursively
-                        envelopes = List.Transform(geometry[Components], each @privGetEnvelope(_)),
+                        envelopes = List.Transform(geometry[Components], each @GeometryGetEnvelope(_)),
                         //Extract mins and maxs
                         envelope = envelopsToEnvelope(envelopes)
                     in [
@@ -147,7 +150,7 @@ let
                 GEOMETRYCOLLECTION = (geometry as record) => (
                     let
                         //Compute envelopes for each component recursively
-                        envelopes = List.Transform(geometry[Components], each @privGetEnvelope(_)),
+                        envelopes = List.Transform(geometry[Components], each @GeometryGetEnvelope(_)),
                         //Extract mins and maxs
                         envelope = envelopsToEnvelope(envelopes)
                     in [
@@ -161,6 +164,10 @@ let
         in
             Record.Field(switch, geometry[Kind])(geometry)
     ),
+    //Creates a TShape point from latitude and longitude coordinates
+    //@param lat - The latitude coordinate
+    //@param lng - The longitude coordinate
+    //@returns - A TShape record representing the point geometry
     ShapeCreatePointFromLatLng = Value.ReplaceType(
         (lat as number, lng as number) as record => (
             let
@@ -169,17 +176,20 @@ let
                 __TShapeIdentifier__ = null,
                 Kind = baseGeometry[Kind],
                 Geometry = baseGeometry,
-                Envelope = privGetEnvelope(baseGeometry),
+                Envelope = GeometryGetEnvelope(baseGeometry),
                 __rowid__ = null
             ]
         ),
         type function (lat as number, lng as number) as TShape
     ),
+    //Creates a TShape from Well-Known Text (WKT) representation
+    //@param wkt - The Well-Known Text string representing the geometry
+    //@returns - A TShape record representing the geometry
     ShapeCreateFromWKT = Value.ReplaceType(
         (wkt as text) as record => (
             let 
                 baseGeometry = Geometry.FromWellKnownText(wkt),
-                envelope = privGetEnvelope(baseGeometry)
+                envelope = GeometryGetEnvelope(baseGeometry)
             in [
                 __TShapeIdentifier__ = null,
                 Kind = baseGeometry[Kind],
@@ -190,7 +200,9 @@ let
         ), 
         type function (wkt as text) as TShape
     ),
-    // Ensures a table has a numeric __rowid__ column unique per row. If absent, adds it as index starting 0.
+    //Ensures a table has a numeric __rowid__ column unique per row
+    //@param tbl - The table to ensure has a __rowid__ column
+    //@returns - The table with __rowid__ column (added as index starting from 0 if not present)
     EnsureRowIdColumn = (tbl as table) as table => (
         let
             hasCol = Table.HasColumns(tbl, "__rowid__"),
@@ -239,6 +251,10 @@ let
         additionalColumns = nullable {text}
     ],
     TRowQueryOperator = type function (candidate as record) as logical,
+    //Checks if two bounding boxes (envelopes) intersect
+    //@param b1 - The first bounding box
+    //@param b2 - The second bounding box
+    //@returns - True if the boxes intersect, false otherwise
     QuadTreeBoxesIntersect = Value.ReplaceType(
         (b1 as record, b2 as record) as logical => (
             not (
@@ -250,6 +266,9 @@ let
         ),
         type function (b1 as TShapeEnvelope, b2 as TShapeEnvelope) as logical
     ),
+    //Subdivides a quadtree node into four children (SW, SE, NE, NW)
+    //@param node - The node to subdivide
+    //@returns - The subdivided node with four children
     QuadTreeSubdivideNode = Value.ReplaceType(
         (node as record) as record => (
             let
@@ -274,6 +293,10 @@ let
         ),
         type function (node as TQuadTreeNode) as TQuadTreeNode
     ),
+    //Creates a new empty quadtree with specified capacity
+    //@param capacity - The maximum number of shapes per node before subdivision
+    //@param initialEnvelope - The initial bounding envelope (null uses default [0,0,0,0])
+    //@returns - A new empty quadtree
     QuadTreeCreate = Value.ReplaceType(
         (capacity as number, initialEnvelope as nullable record) as record => (
             [
@@ -293,6 +316,11 @@ let
         ),
         type function (capacity as number, initialEnvelope as nullable TShapeEnvelope) as TQuadTree
     ),
+    //Inserts a shape into a quadtree node, handling subdivision and envelope expansion as needed
+    //@param node - The node to insert the shape into
+    //@param shape - The shape to insert
+    //@param isRoot - Whether this node is the root of the quadtree
+    //@returns - The updated node with the shape inserted
     QuadTreeNodeInsert = Value.ReplaceType(
         (node as record, shape as record, isRoot as logical) as record => (
             let
@@ -428,6 +456,10 @@ let
         type function (node as TQuadTreeNode, shape as TShape, isRoot as logical) as TQuadTreeNode
     ),
     
+    //Inserts a shape into a quadtree
+    //@param quadTree - The quadtree to insert the shape into
+    //@param shape - The shape to insert
+    //@returns - The updated quadtree with the shape inserted
     QuadTreeInsert = Value.ReplaceType(
         (quadTree as record, shape as record) as record => (
             let
@@ -440,7 +472,9 @@ let
         type function (quadTree as TQuadTree, shape as TShape) as TQuadTree
     ),
 
-    //Candidate envelope intersects query envelope
+    //Query operator that tests if candidate envelope intersects query envelope
+    //@returns - An operator that returns shapes whose envelopes intersect the query shape
+    //@remark This is an envelope-based test, not a true geometric intersection
     QuadTreeOperatorIntersect = Value.ReplaceType([
         onCandidate = (candidate as record, query as record) as list =>
             let
@@ -464,7 +498,9 @@ let
         TQuadTreeQueryOperator
     ),
 
-    //Candidate envelope fully contains query envelope
+    //Query operator that tests if candidate envelope fully contains query envelope
+    //@returns - An operator that returns shapes whose envelopes contain the query shape
+    //@remark This is an envelope-based test, not a true geometric containment
     QuadTreeOperatorContains = Value.ReplaceType(
         [
             onCandidate = (candidate as record, query as record) as list =>
@@ -485,7 +521,9 @@ let
         TQuadTreeQueryOperator
     ),
     
-    //Candidate envelope fully inside query envelope
+    //Query operator that tests if candidate envelope is fully inside query envelope
+	//@returns - An operator that returns shapes whose envelopes are within the query shape
+	//@remark This is an envelope-based test, not a true geometric within relationship
 	QuadTreeOperatorWithin = Value.ReplaceType(
 	    [
 	        onCandidate = (candidate as record, query as record) as list =>
@@ -506,7 +544,10 @@ let
 	    TQuadTreeQueryOperator
 	),
 
-    //Nearest neighbor
+    //Query operator that finds the k nearest neighbors to the query shape
+    //@param k - The number of nearest neighbors to find
+    //@returns - An operator that returns the k nearest shapes based on envelope center distance
+    //@remark Distance is calculated between envelope centers, not actual geometry. Results include a 'dist' column.
     QuadTreeOperatorNearestN = Value.ReplaceType(
         (k as number) as record =>
             [
@@ -541,9 +582,14 @@ let
             type function (k as number) as TQuadTreeQueryOperator
     ),
 
-    //Nearest neighbor
+    //Query operator that finds the single nearest neighbor to the query shape
+    //@returns TQuadTreeQueryOperator - An operator that returns the nearest shape based on envelope center distance
+    //@remark This is a convenience wrapper for QuadTreeOperatorNearestN(1)
     QuadTreeOperatorNearest = QuadTreeOperatorNearestN(1),
 
+    //Normalizes a value to a list, converting null to empty list and single values to single-element lists
+    //@param value as (Null | List<Any> | Any) - The value to normalize to a list
+    //@returns List<any> - A list representation of the input value
     NormalizeList = (value as any) as list =>
         if value = null then
             {}
@@ -552,7 +598,10 @@ let
         else
             { value },
 
-    // Ensure all records have the same schema by adding missing columns as null
+    //Ensures all records have the same schema by adding missing columns as null
+    //@param records as List<Record> - The list of records to normalize
+    //@param additionalColumns as (Null | List<Text>) - Additional column names that should be present in all records
+    //@returns List<Record> - The normalized list of records with consistent schema
     NormalizeRecords = (records as list, additionalColumns as nullable list) as list =>
         if additionalColumns = null or List.Count(additionalColumns) = 0 then
             records
@@ -569,7 +618,11 @@ let
                         Record.Combine({r, additionalRecord})
             ),
 
-    //Query a node based on a spatial relationship to a supplied shape
+    //Queries a quadtree node based on a spatial relationship to a supplied shape
+    //@param node - The node to query
+    //@param shape - The shape to query against
+    //@param operator - The query operator defining the spatial relationship
+    //@returns (List<Record> | Any) - Query results (type depends on operator's combine function, typically List<Record>)
     QuadTreeNodeQuery = Value.ReplaceType(
         (node as record, shape as record, operator as record) as any =>
             let
@@ -622,6 +675,11 @@ let
         type function (node as TQuadTreeNode, shape as TShape, operator as TQuadTreeQueryOperator) as any
     ),
     
+	//Queries a quadtree based on a spatial relationship to a supplied shape
+	//@param qt - The quadtree to query
+	//@param shape - The shape to query against
+	//@param op - The query operator defining the spatial relationship
+	//@returns List<Record> - A list of query results (each result is typically a record with a shape field)
 	QuadTreeQuery = Value.ReplaceType(
         (qt as record, shape as record, op as record) as list =>
             let
@@ -632,6 +690,10 @@ let
         type function (qt as TQuadTree, shape as TShape, op as TQuadTreeQueryOperator) as list
     ),
 
+    //Prunes a quadtree node to only include shapes with specified row IDs
+    //@param node - The node to prune
+    //@param ids as List<Number> - A list of row IDs to keep
+    //@returns - The pruned node containing only shapes with matching IDs
     QuadTreeNodePrune = Value.ReplaceType(
         (node as record, ids as list) as record => (
             let
@@ -644,10 +706,10 @@ let
         type function (node as TQuadTreeNode, ids as list) as TQuadTreeNode
     ),
 
-    //Create a blank layer
-    //@param geometryColumn - The column that should contain the geometry
-    //@param capacity - The capacity of the quadtree
-    //@return The created layer, the table of which has the same columns as the original table.
+    //Creates a blank layer with no data
+    //@param geometryColumn - The column name that should contain the geometry (default: "shape")
+    //@param capacity - The capacity of the quadtree (default: 10)
+    //@returns - The created blank layer with an empty table
     LayerCreateBlank = Value.ReplaceType(
         (geometryColumn as nullable text, capacity as nullable number) as record => (
             let
@@ -664,10 +726,11 @@ let
         type function (geometryColumn as nullable text, capacity as nullable number) as TLayer
     ),
 
-    //Create a layer from a table
+    //Creates a layer from a table with TShape objects
     //@param tbl - The table to create the layer from
-    //@param geometryColumn - The column that contains the geometry
-    //@return The created layer, the table of which has the same columns as the original table.
+    //@param geometryColumn - The column name that contains TShape geometry objects
+    //@returns - The created layer with the table and spatial index
+    //@remark The geometry column must contain TShape objects, not WKT strings. Use LayerCreateFromTableWithWKT for WKT input.
     LayerCreateFromTable = Value.ReplaceType(
         (tbl as table, geometryColumn as text) as record => (
             let
@@ -698,10 +761,11 @@ let
         type function (tbl as table, geometryColumn as text) as TLayer
     ),
 
-    //Insert rows into a layer
+    //Inserts rows into a layer and updates the spatial index
     //@param layer - The layer to insert the rows into
-    //@param rows - The rows to insert
-    //@return The updated layer, the table of which has the same columns as the original layer.
+    //@param rows as List<Record> - The list of records (rows) to insert
+    //@returns - The updated layer with the inserted rows
+    //@remark Rows should have the geometry column populated with TShape objects
 	LayerInsertRows = Value.ReplaceType(
 		(layer as record, rows as list) as record => (
 			let
@@ -745,11 +809,11 @@ let
 		type function (layer as TLayer, rows as list) as TLayer
 	),
 
-    //Query a layer based on a spatial relationship to a supplied shape
+    //Queries a layer based on a spatial relationship to a supplied shape
     //@param layer - The layer to query
     //@param shape - The shape to query against
-    //@param gisOperator - A function that takes two shapes and returns a logical value indicating if they meet the spatial relationship.
-    //@return The queried layer, the table of which has the same columns as the original layer.
+    //@param gisOperator - The spatial operator defining the relationship (e.g., Intersect, Contains, Within)
+    //@returns - A new layer containing only the rows that match the spatial query
     LayerQuerySpatial = Value.ReplaceType(
         (layer as record, shape as record, gisOperator as record) as record => (
             let
@@ -772,10 +836,11 @@ let
         type function (layer as TLayer, shape as TShape, gisOperator as TQuadTreeQueryOperator) as TLayer
     ),
 
-    //Query a layer based on a row-wise relational operator
+    //Queries a layer based on a row-wise relational operator (attribute-based filtering)
     //@param layer - The layer to query
-    //@param operator - The relational operator to use for the query.
-    //@return The queried layer, the table of which has the same columns as the original layer.
+    //@param operator => Logical - A function that takes a record and returns true/false
+    //@returns - A new layer containing only the rows that match the relational query
+    //@remark This is equivalent to Table.SelectRows but also updates the spatial index
     LayerQueryRelational = Value.ReplaceType(
         (layer as record, operator as function) as record => (
             let
@@ -796,10 +861,10 @@ let
         type function (layer as TLayer, operator as TRowQueryOperator) as TLayer
     ),
 
-    //Create a layer from a table with a WKT column
+    //Creates a layer from a table with a Well-Known Text (WKT) geometry column
     //@param tbl - The table to create the layer from
-    //@param wktColumn - The column that contains WKT text
-    //@return The created layer, the table of which has the same columns as the original table, with the WKT column transformed to TShape objects.
+    //@param wktColumn - The column name that contains WKT text
+    //@returns - The created layer with WKT column transformed to TShape objects
     LayerCreateFromTableWithWKT = Value.ReplaceType(
         (tbl as table, wktColumn as text) as record => (
             let
