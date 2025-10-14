@@ -6,6 +6,10 @@ let
     //@description: GIS library for the PowerQuery M-lang ecosystem.
     //@author: Sancarn
 
+    //**************************************************
+    // Geometric Base Type
+    //**************************************************
+
     //Base types as outputted by Geometry.FromWellKnownText() base function.
     TBasePoint = type [
         Kind = Value.Type("POINT"),
@@ -36,26 +40,7 @@ let
         Kind = Value.Type("GEOMETRYCOLLECTION"),
         Components = {any}                        //Hack: No union types in M-lang
     ],
-    TShapeEnvelope = type [
-        MinX = number,
-        MinY = number,
-        MaxX = number,
-        MaxY = number
-    ],
-    TShape = type [
-        //To ensure this is a TShape, not some other record, we add this field. It won't be used for any other purpose. Just a sanity check.
-        __TShapeIdentifier__ = null,
-        //Kind as "POINT" | "LINESTRING" | "POLYGON" | "MULTIPOINT" | "MULTILINESTRING" | "MULTIPOLYGON" | "GEOMETRYCOLLECTION"
-        Kind = text,
-        //Geometry as TBasePoint | TBaseLineString | TBasePolygon | TBaseMultiPoint | TBaseMultiLineString | TBaseMultiPolygon | TBaseGeometryCollection
-        Geometry = any,  //Hack: No union types in M-lang
-        Envelope = TShapeEnvelope,
-        __rowid__ = nullable number
-    ],
-    TProjection = type [
-        Name = text
-        //TODO: Add more projection properties
-    ],
+    
     //Calculates the bounding envelope (min/max X and Y) for any geometry type
     //@param geometry as (TBasePoint | TBaseLineString | TBasePolygon | TBaseMultiPoint | TBaseMultiLineString | TBaseMultiPolygon | TBaseGeometryCollection) - The geometry object to calculate the envelope for
     //@returns TShapeEnvelope - A record with MinX, MinY, MaxX, MaxY representing the bounding box
@@ -164,6 +149,341 @@ let
         in
             Record.Field(switch, geometry[Kind])(geometry)
     ),
+
+
+    //Checks if a point is inside a polygon using the ray casting algorithm
+    //@param point - The point to test
+    //@param polygon - The polygon to test against
+    //@returns - True if the point is inside the polygon, false otherwise
+    GeometryPointInPolygon = (point as record, polygon as record) as logical => (
+        let
+            x = point[X],
+            y = point[Y],
+            rings = polygon[Rings],
+            //Test against the outer ring (first ring)
+            outerRing = rings{0},
+            points = outerRing[Points],
+            n = List.Count(points),
+            
+            //Ray casting algorithm
+            crossings = List.Accumulate(
+                List.Positions(points),
+                0,
+                (state as number, i as number) as number => (
+                    let
+                        j = if i = n - 1 then 0 else i + 1,
+                        pi = points{i},
+                        pj = points{j},
+                        yi = pi[Y],
+                        yj = pj[Y],
+                        xi = pi[X],
+                        xj = pj[X],
+                        intersects = ((yi > y) <> (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi)
+                    in
+                        if intersects then state + 1 else state
+                )
+            ),
+            inOuterRing = Number.Mod(crossings, 2) = 1,
+            
+            //Check holes (remaining rings)
+            inHole = if List.Count(rings) > 1 then
+                List.MatchesAny(
+                    List.Skip(rings, 1),
+                    (holeRing as record) as logical => (
+                        let
+                            holePoints = holeRing[Points],
+                            holeN = List.Count(holePoints),
+                            holeCrossings = List.Accumulate(
+                                List.Positions(holePoints),
+                                0,
+                                (state as number, i as number) as number => (
+                                    let
+                                        j = if i = holeN - 1 then 0 else i + 1,
+                                        pi = holePoints{i},
+                                        pj = holePoints{j},
+                                        yi = pi[Y],
+                                        yj = pj[Y],
+                                        xi = pi[X],
+                                        xj = pj[X],
+                                        intersects = ((yi > y) <> (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi)
+                                    in
+                                        if intersects then state + 1 else state
+                                )
+                            )
+                        in
+                            Number.Mod(holeCrossings, 2) = 1
+                    )
+                )
+            else
+                false
+        in
+            inOuterRing and not inHole
+    ),
+    
+    //Checks if two line segments intersect
+    //@param p1 - Start point of first segment
+    //@param p2 - End point of first segment
+    //@param p3 - Start point of second segment
+    //@param p4 - End point of second segment
+    //@returns - True if the segments intersect, false otherwise
+    GeometrySegmentsIntersect = (p1 as record, p2 as record, p3 as record, p4 as record) as logical => (
+        let
+            x1 = p1[X], y1 = p1[Y],
+            x2 = p2[X], y2 = p2[Y],
+            x3 = p3[X], y3 = p3[Y],
+            x4 = p4[X], y4 = p4[Y],
+            
+            denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4),
+            
+            result = if denom = 0 then
+                //Segments are parallel or collinear
+                false
+            else
+                let
+                    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom,
+                    u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
+                in
+                    t >= 0 and t <= 1 and u >= 0 and u <= 1
+        in
+            result
+    ),
+    
+    //Checks if two geometries intersect
+    //@param geom1 - The first geometry
+    //@param geom2 - The second geometry
+    //@returns - True if the geometries intersect, false otherwise
+    GeometryIntersects = (geom1 as record, geom2 as record) as logical => (
+        let
+            kind1 = geom1[Kind],
+            kind2 = geom2[Kind],
+            
+            //Point-Point intersection
+            pointPointIntersects = (p1 as record, p2 as record) as logical =>
+                p1[X] = p2[X] and p1[Y] = p2[Y],
+            
+            //Point-Polygon intersection
+            pointPolygonIntersects = (point as record, polygon as record) as logical =>
+                @GeometryPointInPolygon(point, polygon),
+            
+            //Point-LineString intersection
+            pointLineStringIntersects = (point as record, linestring as record) as logical =>
+                List.MatchesAny(
+                    linestring[Points],
+                    (p as record) as logical => p[X] = point[X] and p[Y] = point[Y]
+                ),
+            
+            //LineString-LineString intersection
+            lineStringLineStringIntersects = (ls1 as record, ls2 as record) as logical =>
+                let
+                    points1 = ls1[Points],
+                    points2 = ls2[Points]
+                in
+                    List.MatchesAny(
+                        List.Transform({0..List.Count(points1)-2}, each _),
+                        (i as number) as logical =>
+                            List.MatchesAny(
+                                List.Transform({0..List.Count(points2)-2}, each _),
+                                (j as number) as logical =>
+                                    @GeometrySegmentsIntersect(points1{i}, points1{i+1}, points2{j}, points2{j+1})
+                            )
+                    ),
+            
+            //LineString-Polygon intersection
+            lineStringPolygonIntersects = (linestring as record, polygon as record) as logical =>
+                let
+                    points = linestring[Points],
+                    //Check if any vertex is inside the polygon
+                    anyPointInside = List.MatchesAny(points, (p as record) as logical => @GeometryPointInPolygon(p, polygon)),
+                    //Check if any segment intersects the polygon boundary
+                    rings = polygon[Rings],
+                    anySegmentCrossesBoundary = List.MatchesAny(
+                        List.Transform({0..List.Count(points)-2}, each _),
+                        (i as number) as logical =>
+                            List.MatchesAny(
+                                rings,
+                                (ring as record) as logical =>
+                                    let
+                                        ringPoints = ring[Points]
+                                    in
+                                        List.MatchesAny(
+                                            List.Transform({0..List.Count(ringPoints)-2}, each _),
+                                            (j as number) as logical =>
+                                                @GeometrySegmentsIntersect(points{i}, points{i+1}, ringPoints{j}, ringPoints{j+1})
+                                        )
+                            )
+                    )
+                in
+                    anyPointInside or anySegmentCrossesBoundary,
+            
+            //Polygon-Polygon intersection
+            polygonPolygonIntersects = (poly1 as record, poly2 as record) as logical =>
+                let
+                    rings1 = poly1[Rings],
+                    rings2 = poly2[Rings],
+                    //Check if any vertex of poly1 is inside poly2
+                    anyP1PointInP2 = List.MatchesAny(
+                        rings1{0}[Points],
+                        (p as record) as logical => @GeometryPointInPolygon(p, poly2)
+                    ),
+                    //Check if any vertex of poly2 is inside poly1
+                    anyP2PointInP1 = List.MatchesAny(
+                        rings2{0}[Points],
+                        (p as record) as logical => @GeometryPointInPolygon(p, poly1)
+                    ),
+                    //Check if any edges intersect
+                    anyEdgesIntersect = List.MatchesAny(
+                        rings1,
+                        (ring1 as record) as logical =>
+                            let
+                                points1 = ring1[Points]
+                            in
+                                List.MatchesAny(
+                                    rings2,
+                                    (ring2 as record) as logical =>
+                                        let
+                                            points2 = ring2[Points]
+                                        in
+                                            List.MatchesAny(
+                                                List.Transform({0..List.Count(points1)-2}, each _),
+                                                (i as number) as logical =>
+                                                    List.MatchesAny(
+                                                        List.Transform({0..List.Count(points2)-2}, each _),
+                                                        (j as number) as logical =>
+                                                            @GeometrySegmentsIntersect(points1{i}, points1{i+1}, points2{j}, points2{j+1})
+                                                    )
+                                            )
+                                )
+                    )
+                in
+                    anyP1PointInP2 or anyP2PointInP1 or anyEdgesIntersect,
+            
+            result = 
+                if kind1 = "POINT" and kind2 = "POINT" then
+                    pointPointIntersects(geom1, geom2)
+                else if kind1 = "POINT" and kind2 = "POLYGON" then
+                    pointPolygonIntersects(geom1, geom2)
+                else if kind1 = "POLYGON" and kind2 = "POINT" then
+                    pointPolygonIntersects(geom2, geom1)
+                else if kind1 = "POINT" and kind2 = "LINESTRING" then
+                    pointLineStringIntersects(geom1, geom2)
+                else if kind1 = "LINESTRING" and kind2 = "POINT" then
+                    pointLineStringIntersects(geom2, geom1)
+                else if kind1 = "LINESTRING" and kind2 = "LINESTRING" then
+                    lineStringLineStringIntersects(geom1, geom2)
+                else if kind1 = "LINESTRING" and kind2 = "POLYGON" then
+                    lineStringPolygonIntersects(geom1, geom2)
+                else if kind1 = "POLYGON" and kind2 = "LINESTRING" then
+                    lineStringPolygonIntersects(geom2, geom1)
+                else if kind1 = "POLYGON" and kind2 = "POLYGON" then
+                    polygonPolygonIntersects(geom1, geom2)
+                else if kind1 = "MULTIPOINT" then
+                    List.MatchesAny(geom1[Components], (comp as record) as logical => @GeometryIntersects(comp, geom2))
+                else if kind2 = "MULTIPOINT" then
+                    List.MatchesAny(geom2[Components], (comp as record) as logical => @GeometryIntersects(geom1, comp))
+                else if kind1 = "MULTILINESTRING" then
+                    List.MatchesAny(geom1[Components], (comp as record) as logical => @GeometryIntersects(comp, geom2))
+                else if kind2 = "MULTILINESTRING" then
+                    List.MatchesAny(geom2[Components], (comp as record) as logical => @GeometryIntersects(geom1, comp))
+                else if kind1 = "MULTIPOLYGON" then
+                    List.MatchesAny(geom1[Components], (comp as record) as logical => @GeometryIntersects(comp, geom2))
+                else if kind2 = "MULTIPOLYGON" then
+                    List.MatchesAny(geom2[Components], (comp as record) as logical => @GeometryIntersects(geom1, comp))
+                else if kind1 = "GEOMETRYCOLLECTION" then
+                    List.MatchesAny(geom1[Components], (comp as record) as logical => @GeometryIntersects(comp, geom2))
+                else if kind2 = "GEOMETRYCOLLECTION" then
+                    List.MatchesAny(geom2[Components], (comp as record) as logical => @GeometryIntersects(geom1, comp))
+                else
+                    false
+        in
+            result
+    ),
+    
+    //Checks if geometry1 contains geometry2 (all points of geom2 are inside geom1)
+    //@param geom1 - The containing geometry
+    //@param geom2 - The geometry to test
+    //@returns - True if geom1 contains geom2, false otherwise
+    GeometryContains = (geom1 as record, geom2 as record) as logical => (
+        let
+            kind1 = geom1[Kind],
+            kind2 = geom2[Kind],
+            
+            //Point contains point
+            pointContainsPoint = (p1 as record, p2 as record) as logical =>
+                p1[X] = p2[X] and p1[Y] = p2[Y],
+            
+            //Polygon contains point
+            polygonContainsPoint = (polygon as record, point as record) as logical =>
+                @GeometryPointInPolygon(point, polygon),
+            
+            //Polygon contains linestring (all points must be inside)
+            polygonContainsLineString = (polygon as record, linestring as record) as logical =>
+                List.MatchesAll(linestring[Points], (p as record) as logical => @GeometryPointInPolygon(p, polygon)),
+            
+            //Polygon contains polygon (all points of inner polygon must be in outer)
+            polygonContainsPolygon = (outerPoly as record, innerPoly as record) as logical =>
+                let
+                    allPointsInside = List.MatchesAll(
+                        innerPoly[Rings]{0}[Points],
+                        (p as record) as logical => @GeometryPointInPolygon(p, outerPoly)
+                    )
+                in
+                    allPointsInside,
+            
+            result =
+                if kind1 = "POINT" and kind2 = "POINT" then
+                    pointContainsPoint(geom1, geom2)
+                else if kind1 = "POLYGON" and kind2 = "POINT" then
+                    polygonContainsPoint(geom1, geom2)
+                else if kind1 = "POLYGON" and kind2 = "LINESTRING" then
+                    polygonContainsLineString(geom1, geom2)
+                else if kind1 = "POLYGON" and kind2 = "POLYGON" then
+                    polygonContainsPolygon(geom1, geom2)
+                else if kind1 = "MULTIPOLYGON" then
+                    List.MatchesAny(geom1[Components], (comp as record) as logical => @GeometryContains(comp, geom2))
+                else if kind2 = "MULTIPOINT" then
+                    List.MatchesAll(geom2[Components], (comp as record) as logical => @GeometryContains(geom1, comp))
+                else if kind2 = "MULTILINESTRING" then
+                    List.MatchesAll(geom2[Components], (comp as record) as logical => @GeometryContains(geom1, comp))
+                else if kind2 = "MULTIPOLYGON" then
+                    List.MatchesAll(geom2[Components], (comp as record) as logical => @GeometryContains(geom1, comp))
+                else
+                    false
+        in
+            result
+    ),
+    
+    //Checks if geometry1 is within geometry2 (all points of geom1 are inside geom2)
+    //@param geom1 - The geometry to test
+    //@param geom2 - The containing geometry
+    //@returns - True if geom1 is within geom2, false otherwise
+    GeometryWithin = (geom1 as record, geom2 as record) as logical =>
+        GeometryContains(geom2, geom1),
+
+    //**************************************************
+    // Shape Wrapper Type
+    //**************************************************
+
+    TShapeEnvelope = type [
+        MinX = number,
+        MinY = number,
+        MaxX = number,
+        MaxY = number
+    ],
+    TShape = type [
+        //To ensure this is a TShape, not some other record, we add this field. It won't be used for any other purpose. Just a sanity check.
+        __TShapeIdentifier__ = null,
+        //Kind as "POINT" | "LINESTRING" | "POLYGON" | "MULTIPOINT" | "MULTILINESTRING" | "MULTIPOLYGON" | "GEOMETRYCOLLECTION"
+        Kind = text,
+        //Geometry as TBasePoint | TBaseLineString | TBasePolygon | TBaseMultiPoint | TBaseMultiLineString | TBaseMultiPolygon | TBaseGeometryCollection
+        Geometry = any,  //Hack: No union types in M-lang
+        Envelope = TShapeEnvelope,
+        __rowid__ = nullable number
+    ],
+    TProjection = type [
+        Name = text
+        //TODO: Add more projection properties
+    ],
+    
     //Creates a TShape point from latitude and longitude coordinates
     //@param lat - The latitude coordinate
     //@param lng - The longitude coordinate
@@ -476,10 +796,12 @@ let
         type function (quadTree as TQuadTree, shape as TShape) as TQuadTree
     ),
 
+
+
     //Query operator that tests if candidate envelope intersects query envelope
     //@returns - An operator that returns shapes whose envelopes intersect the query shape
     //@remark This is an envelope-based test, not a true geometric intersection
-    QuadTreeOperatorIntersect = Value.ReplaceType([
+    QuadTreeOperatorEnvelopeIntersects = Value.ReplaceType([
         onCandidate = (candidate as record, query as record) as list =>
             let
                 _ = if not Record.HasFields(candidate, {"__TShapeIdentifier__"}) then error "Candidate is not a TShape" else null,
@@ -501,11 +823,33 @@ let
         ],
         TQuadTreeQueryOperator
     ),
+    
+    //Query operator that tests if candidate geometry truly intersects query geometry
+    //@returns - An operator that returns shapes that geometrically intersect the query shape
+    //@remark This performs true geometric intersection checking all vertices, with envelope pre-filter for performance
+    QuadTreeOperatorIntersects = Value.ReplaceType([
+        onCandidate = (candidate as record, query as record) as list =>
+            let
+                //Use envelope operator as fast pre-filter (includes validation)
+                envelopeResult = QuadTreeOperatorEnvelopeIntersects[onCandidate](candidate, query),
+                //Only do expensive geometric check if envelope test passed
+                intersects = if List.Count(envelopeResult) > 0 then
+                    GeometryIntersects(candidate[Geometry], query[Geometry])
+                else
+                    false
+            in
+                if intersects then envelopeResult else {},
+            combine = null,
+            continueSearch = null,
+            additionalColumns = null
+        ],
+        TQuadTreeQueryOperator
+    ),
 
     //Query operator that tests if candidate envelope fully contains query envelope
     //@returns - An operator that returns shapes whose envelopes contain the query shape
     //@remark This is an envelope-based test, not a true geometric containment
-    QuadTreeOperatorContains = Value.ReplaceType(
+    QuadTreeOperatorEnvelopeContains = Value.ReplaceType(
         [
             onCandidate = (candidate as record, query as record) as list =>
                 let
@@ -525,10 +869,32 @@ let
         TQuadTreeQueryOperator
     ),
     
+    //Query operator that tests if candidate geometry truly contains query geometry
+    //@returns - An operator that returns shapes that geometrically contain the query shape
+    //@remark This performs true geometric containment checking all vertices, with envelope pre-filter for performance
+    QuadTreeOperatorContains = Value.ReplaceType([
+        onCandidate = (candidate as record, query as record) as list =>
+            let
+                //Use envelope operator as fast pre-filter (includes validation)
+                envelopeResult = QuadTreeOperatorEnvelopeContains[onCandidate](candidate, query),
+                //Only do expensive geometric check if envelope test passed
+                contains = if List.Count(envelopeResult) > 0 then
+                    GeometryContains(candidate[Geometry], query[Geometry])
+                else
+                    false
+            in
+                if contains then envelopeResult else {},
+            combine = null,
+            continueSearch = null,
+            additionalColumns = null
+        ],
+        TQuadTreeQueryOperator
+    ),
+    
     //Query operator that tests if candidate envelope is fully inside query envelope
 	//@returns - An operator that returns shapes whose envelopes are within the query shape
 	//@remark This is an envelope-based test, not a true geometric within relationship
-	QuadTreeOperatorWithin = Value.ReplaceType(
+	QuadTreeOperatorEnvelopeWithin = Value.ReplaceType(
 	    [
 	        onCandidate = (candidate as record, query as record) as list =>
 	            let
@@ -547,6 +913,28 @@ let
 	    ],
 	    TQuadTreeQueryOperator
 	),
+    
+    //Query operator that tests if candidate geometry is truly within query geometry
+    //@returns - An operator that returns shapes that are geometrically within the query shape
+    //@remark This performs true geometric within checking all vertices, with envelope pre-filter for performance
+    QuadTreeOperatorWithin = Value.ReplaceType([
+        onCandidate = (candidate as record, query as record) as list =>
+            let
+                //Use envelope operator as fast pre-filter (includes validation)
+                envelopeResult = QuadTreeOperatorEnvelopeWithin[onCandidate](candidate, query),
+                //Only do expensive geometric check if envelope test passed
+                within = if List.Count(envelopeResult) > 0 then
+                    GeometryWithin(candidate[Geometry], query[Geometry])
+                else
+                    false
+            in
+                if within then envelopeResult else {},
+            combine = null,
+            continueSearch = null,
+            additionalColumns = null
+        ],
+        TQuadTreeQueryOperator
+    ),
 
     //Query operator that finds the k nearest neighbors to the query shape
     //@param k - The number of nearest neighbors to find
@@ -901,7 +1289,7 @@ let
             let
                 //TODO: Need to reproject layer 2 to layer 1's projection
                 actualJoinType = joinType ?? "Inner",
-                actualGisOperator = gisOperator ?? [onCandidate = QuadTreeOperatorIntersect],
+                actualGisOperator = gisOperator ?? [onCandidate = QuadTreeOperatorEnvelopeIntersects],
                 table1 = layer1[table],
                 table2 = layer2[table],
                 geomCol1 = layer1[geometryColumn],
@@ -1189,7 +1577,10 @@ in
         gisLayerQuerySpatial = LayerQuerySpatial,
         gisLayerQueryRelational = LayerQueryRelational,
         gisLayerQueryOperators = [
-            gisIntersects = QuadTreeOperatorIntersect,
+            gisEnvelopeIntersects = QuadTreeOperatorEnvelopeIntersects,
+            gisEnvelopeContains = QuadTreeOperatorEnvelopeContains,
+            gisEnvelopeWithin = QuadTreeOperatorEnvelopeWithin,
+            gisIntersects = QuadTreeOperatorIntersects,
             gisContains = QuadTreeOperatorContains,
             gisWithin = QuadTreeOperatorWithin,
             gisQueryOperatorType = TQuadTreeQueryOperator, //Provided for custom operators
