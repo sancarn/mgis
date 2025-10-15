@@ -458,9 +458,6 @@ let
                 description = "Shapefile should contain valid shape objects with required fields",
                 tags = {"Load", "Shapefile"},
                 passed = passed
-                    RowCount = rowCount,
-                    FirstShapeKind = if firstShape <> null then firstShape[Kind] else "No shapes"
-                ]
             ],
 
     // Test 5.6: Shapefile projection should be loaded
@@ -476,8 +473,6 @@ let
                 description = "Shapefile projection should be loaded from .prj file",
                 tags = {"Load", "Shapefile", "Projection"},
                 passed = passed
-                    ProjectionData = if projectionLoaded then layer[TProjection][Data] else "No projection file"
-                ]
             ],
 
     //===========================================
