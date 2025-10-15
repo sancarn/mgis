@@ -480,7 +480,8 @@ let
         __rowid__ = nullable number
     ],
     TProjection = type [
-        Name = text
+        Name = text,
+        data = any
         //TODO: Add more projection properties
     ],
     
@@ -520,6 +521,92 @@ let
         ), 
         type function (wkt as text) as TShape
     ),
+    //Creates a TShape from a GeoJSON geometry record
+    //@param geojsonRecord - A GeoJSON geometry or Feature record
+    //@returns - A TShape record representing the geometry
+    //@remark Supports all GeoJSON geometry types including GeometryCollection
+    ShapeCreateFromGeoJSONRecord = Value.ReplaceType(
+        (geojsonRecord as record) as record => (
+            let
+                //Extract geometry from Feature if needed
+                geometry = if Record.HasFields(geojsonRecord, "type") and geojsonRecord[type] = "Feature" then
+                    geojsonRecord[geometry]
+                else
+                    geojsonRecord,
+                
+                //Recursive function to convert GeoJSON geometry to base geometry
+                convertGeometry = (geom as record) as record => (
+                    let
+                        geomType = geom[type],
+                        coords = geom[coordinates]?,
+                        
+                        //Convert coordinate pair to point
+                        coordToPoint = (c as list) as record => [Kind = "POINT", X = c{0}, Y = c{1}],
+                        
+                        result = 
+                            if geomType = "Point" then
+                                coordToPoint(coords)
+                            else if geomType = "LineString" then
+                                [Kind = "LINESTRING", Points = List.Transform(coords, coordToPoint)]
+                            else if geomType = "Polygon" then
+                                [
+                                    Kind = "POLYGON", 
+                                    Rings = List.Transform(coords, (ring) => [Kind = "LINESTRING", Points = List.Transform(ring, coordToPoint)])
+                                ]
+                            else if geomType = "MultiPoint" then
+                                [Kind = "MULTIPOINT", Components = List.Transform(coords, coordToPoint)]
+                            else if geomType = "MultiLineString" then
+                                [
+                                    Kind = "MULTILINESTRING", 
+                                    Components = List.Transform(coords, (line) => [Kind = "LINESTRING", Points = List.Transform(line, coordToPoint)])
+                                ]
+                            else if geomType = "MultiPolygon" then
+                                [
+                                    Kind = "MULTIPOLYGON",
+                                    Components = List.Transform(
+                                        coords,
+                                        (poly) => [
+                                            Kind = "POLYGON",
+                                            Rings = List.Transform(poly, (ring) => [Kind = "LINESTRING", Points = List.Transform(ring, coordToPoint)])
+                                        ]
+                                    )
+                                ]
+                            else if geomType = "GeometryCollection" then
+                                [Kind = "GEOMETRYCOLLECTION", Components = List.Transform(geom[geometries], @convertGeometry)]
+                            else
+                                error "Unsupported GeoJSON geometry type: " & geomType
+                    in
+                        result
+                ),
+                
+                baseGeometry = convertGeometry(geometry),
+                envelope = GeometryGetEnvelope(baseGeometry)
+            in [
+                __TShapeIdentifier__ = null,
+                Kind = baseGeometry[Kind],
+                Geometry = baseGeometry,
+                Envelope = envelope,
+                __rowid__ = null
+            ]
+        ),
+        type function (geojsonRecord as record) as TShape
+    ),
+    
+    //Creates a TShape from a GeoJSON text string
+    //@param geojson - A GeoJSON string (geometry or feature)
+    //@returns - A TShape record representing the geometry
+    ShapeCreateFromGeoJSON = Value.ReplaceType(
+        (geojson as text) as record => (
+            let
+                parsed = Json.Document(geojson),
+                shape = ShapeCreateFromGeoJSONRecord(parsed)
+            in
+                shape
+        ),
+        type function (geojson as text) as TShape
+    ),
+
+
     //Ensures a table has a numeric __rowid__ column unique per row
     //@param tbl - The table to ensure has a __rowid__ column
     //@returns - The table with __rowid__ column (added as index starting from 0 if not present)
@@ -1133,7 +1220,8 @@ let
                 _ = if not Table.HasColumns(tbl, {geometryColumn}) then error "Table does not have the geometry column. Please create the column with the relevant `gisShapeCreateFrom...` functions." else null,
                 _2 = if not Table.MatchesAllRows(tbl, each Record.HasFields(_, {"__TShapeIdentifier__"})) then error "Table geometry column does not contain `TShape`s. Please recreate the column with the relevant `gisShapeCreateFrom...` functions." else null,
                 tblWithId = EnsureRowIdColumn(tbl),
-                qtCapacity = Table.RowCount(tblWithId) / 10,
+                qtCapacityRaw = Number.RoundDown(Table.RowCount(tblWithId) / 10),
+                qtCapacity = if qtCapacityRaw < 5 then 5 else qtCapacityRaw,
                 qt = QuadTreeCreate(qtCapacity, null),
                 shapesWithIds = Table.TransformRows(
                     tblWithId,
@@ -1145,10 +1233,17 @@ let
                         in
                             s2
                 ),
-                inserted = List.Accumulate(shapesWithIds, qt, QuadTreeInsert)
+                inserted = List.Accumulate(shapesWithIds, qt, QuadTreeInsert),
+                tableWithUpdatedShapes = Table.FromColumns(
+                    List.Transform(
+                        Table.ColumnNames(tblWithId),
+                        (colName) => if colName = geometryColumn then shapesWithIds else Table.Column(tblWithId, colName)
+                    ),
+                    Table.ColumnNames(tblWithId)
+                )
             in 
                 [
-                    table = tblWithId,
+                    table = tableWithUpdatedShapes,
                     geometryColumn = geometryColumn,
                     queryLayer = inserted,
                     TProjection = null
@@ -1173,6 +1268,432 @@ let
         ),
         type function (tbl as table, wktColumn as text) as TLayer
     ),
+
+    //Creates a layer from a table with a GeoJSON geometry column (text or records)
+    //@param tbl - The table to create the layer from
+    //@param geojsonColumn - The column name that contains GeoJSON text or records
+    //@returns - The created layer with GeoJSON column transformed to TShape objects
+    LayerCreateFromTableWithGeoJSON = Value.ReplaceType(
+        (tbl as table, geojsonColumn as text) as record => (
+            let
+                _ = if not Table.HasColumns(tbl, {geojsonColumn}) then error "Table does not have a column named " & geojsonColumn & "." else null,
+                tblWithShapes = Table.TransformColumns(
+                    tbl, 
+                    {{geojsonColumn, each if Value.Is(_, type text) then ShapeCreateFromGeoJSON(_) else ShapeCreateFromGeoJSONRecord(_), type record}}
+                ),
+                layer = LayerCreateFromTable(tblWithShapes, geojsonColumn),
+                TProjection = null
+            in
+                layer
+        ),
+        type function (tbl as table, geojsonColumn as text) as TLayer
+    ),
+
+    //Creates a layer from a GeoJSON file
+    //@param path - The file path to the GeoJSON file
+    //@returns - The created layer with properties and shape columns
+    //@remark The table will have columns: __rowid__, properties, shape
+    LayerCreateFromGeoJSONFile = Value.ReplaceType(
+        (path as text) as record => (
+            let
+                fileContent = File.Contents(path),
+                jsonText = Text.FromBinary(fileContent),
+                geojson = Json.Document(jsonText),
+                
+                //Validate it's a FeatureCollection
+                _ = if geojson[type] <> "FeatureCollection" then 
+                    error "GeoJSON file must contain a FeatureCollection" 
+                    else null,
+                
+                features = geojson[features],
+                
+                //Convert features to table rows
+                rows = List.Transform(
+                    features,
+                    (feature as record) as record => [
+                        properties = feature[properties]?,
+                        shape = ShapeCreateFromGeoJSONRecord(feature[geometry])
+                    ]
+                ),
+                
+                //Create table from rows
+                tbl = Table.FromRecords(rows),
+                
+                //Create layer
+                layer = LayerCreateFromTable(tbl, "shape")
+            in
+                layer
+        ),
+        type function (path as text) as TLayer
+    ),
+
+    //**************************************************
+    // Shapefile Parser Functions
+    //**************************************************
+
+    //Binary helper functions for shapefile parsing
+    ShapefileReadInt32BE = (buffer as binary, offset as number) as number =>
+        let
+            bytes = Binary.ToList(Binary.Range(buffer, offset, 4)),
+            value = bytes{0} * 16777216 + bytes{1} * 65536 + bytes{2} * 256 + bytes{3}
+        in
+            value,
+
+    ShapefileReadInt16LE = (buffer as binary, offset as number) as number =>
+        let
+            bytes = Binary.ToList(Binary.Range(buffer, offset, 2)),
+            value = bytes{1} * 256 + bytes{0}
+        in
+            value,
+
+    ShapefileReadInt32LE = (buffer as binary, offset as number) as number =>
+        let
+            bytes = Binary.ToList(Binary.Range(buffer, offset, 4)),
+            value = bytes{3} * 16777216 + bytes{2} * 65536 + bytes{1} * 256 + bytes{0}
+        in
+            value,
+
+    ShapefileReadDoubleLE = (buffer as binary, offset as number) as number =>
+        let
+            bytes = Binary.Range(buffer, offset, 8),
+            format = BinaryFormat.Double,
+            value = format(bytes)
+        in
+            value,
+
+    ShapefileReadBoundingBox = (buffer as binary, offset as number) as record =>
+        [
+            MinX = ShapefileReadDoubleLE(buffer, offset),
+            MinY = ShapefileReadDoubleLE(buffer, offset + 8),
+            MaxX = ShapefileReadDoubleLE(buffer, offset + 16),
+            MaxY = ShapefileReadDoubleLE(buffer, offset + 24)
+        ],
+
+    //Shape type constants
+    ShapeTypeNull = 0,
+    ShapeTypePoint = 1,
+    ShapeTypePolyLine = 3,
+    ShapeTypePolygon = 5,
+    ShapeTypeMultiPoint = 8,
+    ShapeTypePointZ = 11,
+    ShapeTypePolyLineZ = 13,
+    ShapeTypePolygonZ = 15,
+    ShapeTypeMultiPointZ = 18,
+    ShapeTypePointM = 21,
+    ShapeTypePolyLineM = 23,
+    ShapeTypePolygonM = 25,
+    ShapeTypeMultiPointM = 28,
+
+    //Parse individual geometry types
+    ShapefileParsePoint = (buffer as binary, offset as number) as record =>
+        [
+            Kind = "POINT",
+            X = ShapefileReadDoubleLE(buffer, offset),
+            Y = ShapefileReadDoubleLE(buffer, offset + 8)
+        ],
+
+    ShapefileParsePointZ = (buffer as binary, offset as number) as record =>
+        [
+            Kind = "POINT",
+            X = ShapefileReadDoubleLE(buffer, offset),
+            Y = ShapefileReadDoubleLE(buffer, offset + 8),
+            Z = ShapefileReadDoubleLE(buffer, offset + 16),
+            M = ShapefileReadDoubleLE(buffer, offset + 24)
+        ],
+
+    ShapefileParsePointM = (buffer as binary, offset as number) as record =>
+        [
+            Kind = "POINT",
+            X = ShapefileReadDoubleLE(buffer, offset),
+            Y = ShapefileReadDoubleLE(buffer, offset + 8),
+            M = ShapefileReadDoubleLE(buffer, offset + 16)
+        ],
+
+    ShapefileParseMultiPoint = (buffer as binary, offset as number) as record =>
+        let
+            bbox = ShapefileReadBoundingBox(buffer, offset),
+            numPoints = ShapefileReadInt32LE(buffer, offset + 32),
+            pointsOffset = offset + 36,
+            points = List.Transform(
+                {0..numPoints-1},
+                (i) => ShapefileParsePoint(buffer, pointsOffset + (i * 16))
+            )
+        in
+            [
+                Kind = "MULTIPOINT",
+                BoundingBox = bbox,
+                Components = points
+            ],
+
+    ShapefileParsePolyShape = (buffer as binary, offset as number, kind as text) as record =>
+        let
+            bbox = ShapefileReadBoundingBox(buffer, offset),
+            numParts = ShapefileReadInt32LE(buffer, offset + 32),
+            numPoints = ShapefileReadInt32LE(buffer, offset + 36),
+            partsOffset = offset + 40,
+            pointsOffset = partsOffset + (numParts * 4),
+            
+            partIndices = List.Transform(
+                {0..numParts-1},
+                (i) => ShapefileReadInt32LE(buffer, partsOffset + (i * 4))
+            ),
+            
+            allPoints = List.Transform(
+                {0..numPoints-1},
+                (i) => ShapefileParsePoint(buffer, pointsOffset + (i * 16))
+            ),
+            
+            parts = List.Transform(
+                {0..numParts-1},
+                (i) => 
+                    let
+                        startIdx = partIndices{i},
+                        endIdx = if i < numParts - 1 then partIndices{i+1} else numPoints,
+                        partPoints = List.Range(allPoints, startIdx, endIdx - startIdx)
+                    in
+                        [Kind = "LINESTRING", Points = partPoints]
+            )
+        in
+            if kind = "POLYGON" then
+                [Kind = "POLYGON", BoundingBox = bbox, Rings = parts]
+            else if numParts = 1 then
+                [Kind = "LINESTRING", BoundingBox = bbox, Points = parts{0}[Points]]
+            else
+                [Kind = "MULTILINESTRING", BoundingBox = bbox, Components = parts],
+
+    ShapefileParseRecord = (buffer as binary, offset as number) as record =>
+        let
+            recordNumber = ShapefileReadInt32BE(buffer, offset),
+            contentLength = ShapefileReadInt32BE(buffer, offset + 4) * 2,
+            shapeType = ShapefileReadInt32LE(buffer, offset + 8),
+            
+            geometry = 
+                if shapeType = ShapeTypeNull then
+                    null
+                else if shapeType = ShapeTypePoint then
+                    ShapefileParsePoint(buffer, offset + 12)
+                else if shapeType = ShapeTypePointZ then
+                    ShapefileParsePointZ(buffer, offset + 12)
+                else if shapeType = ShapeTypePointM then
+                    ShapefileParsePointM(buffer, offset + 12)
+                else if shapeType = ShapeTypeMultiPoint then
+                    ShapefileParseMultiPoint(buffer, offset + 12)
+                else if shapeType = ShapeTypePolyLine then
+                    ShapefileParsePolyShape(buffer, offset + 12, "POLYLINE")
+                else if shapeType = ShapeTypePolygon then
+                    ShapefileParsePolyShape(buffer, offset + 12, "POLYGON")
+                else
+                    error "Unsupported shape type: " & Text.From(shapeType),
+            
+            recordSize = 8 + contentLength
+        in
+            [
+                RecordNumber = recordNumber,
+                ShapeType = shapeType,
+                Geometry = geometry,
+                RecordSize = recordSize
+            ],
+
+    ShapefileParseAll = (shpBuffer as binary) as list =>
+        let
+            parseRecords = (currentOffset as number, accumulator as list) as list =>
+                let
+                    bufferLength = Binary.Length(shpBuffer),
+                    shouldContinue = currentOffset < bufferLength
+                in
+                    if not shouldContinue then
+                        accumulator
+                    else
+                        let
+                            record = try ShapefileParseRecord(shpBuffer, currentOffset) otherwise null
+                        in
+                            if record = null then
+                                accumulator
+                            else
+                                @parseRecords(
+                                    currentOffset + record[RecordSize],
+                                    accumulator & {record}
+                                ),
+            
+            records = parseRecords(100, {}),
+            geometries = List.Transform(records, each _[Geometry])
+        in
+            geometries,
+
+    //Parse dBASE (.dbf) attribute file
+    ShapefileParseDBF = (dbfBuffer as binary) as table =>
+        let
+            GetByte = (offset as number) as number => Binary.ToList(Binary.Range(dbfBuffer, offset, 1)){0},
+            
+            numRecords = ShapefileReadInt32LE(dbfBuffer, 4),
+            headerSize = ShapefileReadInt16LE(dbfBuffer, 8),
+            recordSize = ShapefileReadInt16LE(dbfBuffer, 10),
+            
+            numFields = (headerSize - 33) / 32,
+            
+            ReadFieldDescriptor = (offset as number) as record =>
+                let
+                    nameBytes = Binary.Range(dbfBuffer, offset, 11),
+                    nameList = Binary.ToList(nameBytes),
+                    nullPos = List.PositionOf(nameList, 0),
+                    nameLength = if nullPos = -1 then 11 else nullPos,
+                    name = Text.FromBinary(Binary.Range(nameBytes, 0, nameLength)),
+                    fieldType = Text.FromBinary(Binary.Range(dbfBuffer, offset + 11, 1)),
+                    fieldLength = GetByte(offset + 16),
+                    decimalCount = GetByte(offset + 17)
+                in
+                    [
+                        Name = name,
+                        Type = fieldType,
+                        Length = fieldLength,
+                        DecimalCount = decimalCount
+                    ],
+            
+            fields = List.Transform(
+                {0..numFields-1},
+                (i) => ReadFieldDescriptor(32 + (i * 32))
+            ),
+            
+            recordsOffset = headerSize,
+            
+            ParseRecord = (recordIndex as number) as record =>
+                let
+                    recordOffset = recordsOffset + (recordIndex * recordSize),
+                    deletionFlag = GetByte(recordOffset),
+                    isDeleted = deletionFlag = 42,
+                    
+                    ParseField = (state as record, field as record) as record =>
+                        let
+                            fieldOffset = recordOffset + 1 + state[offset],
+                            fieldBytes = Binary.Range(dbfBuffer, fieldOffset, field[Length]),
+                            fieldText = Text.Trim(Text.FromBinary(fieldBytes)),
+                            
+                            fieldValue = 
+                                if field[Type] = "C" then
+                                    fieldText
+                                else if field[Type] = "N" then
+                                    try Number.From(fieldText) otherwise null
+                                else if field[Type] = "F" then
+                                    try Number.From(fieldText) otherwise null
+                                else if field[Type] = "L" then
+                                    fieldText = "T" or fieldText = "t" or fieldText = "Y" or fieldText = "y"
+                                else if field[Type] = "D" then
+                                    try Date.FromText(
+                                        Text.Range(fieldText, 0, 4) & "-" &
+                                        Text.Range(fieldText, 4, 2) & "-" &
+                                        Text.Range(fieldText, 6, 2)
+                                    ) otherwise null
+                                else
+                                    fieldText,
+                            
+                            newRecord = Record.AddField(state[record], field[Name], fieldValue),
+                            newOffset = state[offset] + field[Length]
+                        in
+                            [record = newRecord, offset = newOffset],
+                    
+                    result = List.Accumulate(
+                        fields,
+                        [record = [], offset = 0],
+                        ParseField
+                    )
+                in
+                    if isDeleted then null else result[record],
+            
+            allRecords = List.Transform({0..numRecords-1}, ParseRecord),
+            validRecords = List.Select(allRecords, each _ <> null),
+            table = Table.FromRecords(validRecords)
+        in
+            table,
+
+    //Converts shapefile base geometry to TShape
+    ShapefileGeometryToTShape = (geometry as nullable record) as nullable record =>
+        if geometry = null then
+            null
+        else
+            let
+                envelope = GeometryGetEnvelope(geometry)
+            in
+                [
+                    __TShapeIdentifier__ = null,
+                    Kind = geometry[Kind],
+                    Geometry = geometry,
+                    Envelope = envelope,
+                    __rowid__ = null
+                ],
+
+    //Creates a layer from a shapefile (.shp, .dbf, .prj)
+    //@param shpPath - The path to the .shp file
+    //@returns - A layer with the shapefile data loaded
+    //@remark Automatically finds .dbf and .prj files with matching base name
+    LayerCreateFromShapefile = Value.ReplaceType(
+        (shpPath as text) as record => (
+            let
+                //Try to find corresponding .dbf and .prj files
+                shpPathNormalized = Text.Lower(shpPath),
+                basePath = 
+                    if Text.EndsWith(shpPathNormalized, ".shp") then
+                        Text.Range(shpPath, 0, Text.Length(shpPath) - 4)
+                    else
+                        shpPath,
+                dbfPath = basePath & ".dbf",
+                prjPath = basePath & ".prj",
+                
+                //Load .shp file
+                shpBuffer = File.Contents(shpPath),
+                geometries = ShapefileParseAll(shpBuffer),
+                
+                //Load .dbf file if it exists
+                dbfTable = try (
+                    let
+                        dbfBuffer = File.Contents(dbfPath),
+                        table = ShapefileParseDBF(dbfBuffer)
+                    in
+                        table
+                ) otherwise (
+                    let
+                        numRecords = List.Count(geometries),
+                        emptyTable = Table.FromRecords(
+                            List.Transform({1..numRecords}, each [])
+                        )
+                    in
+                        emptyTable
+                ),
+                
+                //Load .prj file if it exists (for future use)
+                projection = try (
+                    let
+                        prjBuffer = File.Contents(prjPath),
+                        prjContent = Text.FromBinary(prjBuffer)
+                    in
+                        [Name = null, Data = prjContent]
+                ) otherwise null,
+                
+                //Add geometry column to table
+                combinedTable = Table.AddColumn(
+                    dbfTable,
+                    "shape",
+                    (row) => 
+                        let
+                            rowIndex = Table.PositionOf(dbfTable, row, Occurrence.First)
+                        in
+                            if rowIndex < List.Count(geometries) then
+                                ShapefileGeometryToTShape(geometries{rowIndex})
+                            else
+                                null
+                ),
+                
+                //Create layer from table
+                layer = LayerCreateFromTable(combinedTable, "shape"),
+                
+                //Add projection info
+                layerWithProjection = Record.TransformFields(layer, {"TProjection", each projection})
+            in
+                layerWithProjection
+        ),
+        type function (shpPath as text) as TLayer
+    ),
+
+    
 
     //Inserts rows into a layer and updates the spatial index
     //@param layer - The layer to insert the rows into
@@ -1571,9 +2092,14 @@ let
 in
     [
         gisShapeCreateFromWKT = ShapeCreateFromWKT,
+        gisShapeCreateFromGeoJSON = ShapeCreateFromGeoJSON,
+        gisShapeCreateFromGeoJSONRecord = ShapeCreateFromGeoJSONRecord,
         gisLayerCreateBlank = LayerCreateBlank,
         gisLayerCreateFromTable = LayerCreateFromTable,
         gisLayerCreateFromTableWithWKT = LayerCreateFromTableWithWKT,
+        gisLayerCreateFromTableWithGeoJSON = LayerCreateFromTableWithGeoJSON,
+        gisLayerCreateFromGeoJSONFile = LayerCreateFromGeoJSONFile,
+        gisLayerCreateFromShapefile = LayerCreateFromShapefile,
         gisLayerQuerySpatial = LayerQuerySpatial,
         gisLayerQueryRelational = LayerQueryRelational,
         gisLayerQueryOperators = [
