@@ -3,56 +3,13 @@ let
     GISLib = mgis,
     githubFolder = "C:/Users/Admin/Documents/GitHub",
     
-    // --- Helper function to safely run tests ---
-    RunTest = (testName as text, testFunc as function, description as text, tags as list, testType as text, testing as text) as record =>
+    // --- Helper to check if table has at least one row matching a condition ---
+    HasRowWhere = (tbl as table, condition as function) as logical =>
         let
-            result = try testFunc(),
-            passed = if result[HasError] then false else result[Value][passed],
-            errorMessage = if result[HasError] then result[Error][Message] else 
-                          if not passed then result[Value][errorMessage] else "",
-            actual = if result[HasError] then null else result[Value][actual],
-            expected = if result[HasError] then null else result[Value][expected],
-            metadata = if result[HasError] then [Error = result[Error]] else result[Value][metadata]
+            filtered = try Table.SelectRows(tbl, condition) otherwise #table({}, {}),
+            hasMatch = Table.RowCount(filtered) > 0
         in
-            [
-                name = testName,
-                description = description,
-                tags = tags,
-                testType = testType,
-                testing = testing,
-                expected = expected,
-                actual = actual,
-                passed = passed,
-                errorMessage = errorMessage,
-                metadata = metadata
-            ],
-    
-    // --- Helper to find a row in a table by criteria ---
-    FindRow = (tbl as table, criteriaRecord as record) as record =>
-        let
-            filtered = Table.SelectRows(tbl, (row) => 
-                List.AllTrue(
-                    List.Transform(
-                        Record.FieldNames(criteriaRecord),
-                        (fieldName) => 
-                            let
-                                rowValue = Record.Field(row, fieldName),
-                                expectedValue = Record.Field(criteriaRecord, fieldName)
-                            in
-                                if expectedValue = null then rowValue = null
-                                else if Value.Type(rowValue) = type record then
-                                    Record.HasFields(rowValue, Record.FieldNames(expectedValue)) and
-                                    List.AllTrue(List.Transform(Record.FieldNames(expectedValue), 
-                                        (fn) => Record.Field(rowValue, fn) = Record.Field(expectedValue, fn)))
-                                else rowValue = expectedValue
-                    )
-                )
-            ),
-            rowCount = Table.RowCount(filtered)
-        in
-            if rowCount = 0 then null
-            else if rowCount = 1 then filtered{0}
-            else filtered{0}, // Return first match if multiple
+            hasMatch,
 
     // --- Shortcuts for convenience ---
     gisLayerCreateFromTableWithWKT = GISLib[gisLayerCreateFromTableWithWKT],
@@ -93,59 +50,42 @@ let
             Result,
 
     // Test 1.1: Point ID=1 at (5,5) should be in ZoneA
-    Test1_1_Function = () =>
+    Test1_1 = 
         let
             Result = Test1_Setup,
-            row = FindRow(Result, [layer1 = [ID = 1]]),
-            zoneName = if row <> null and row[layer2] <> null then row[layer2][Name] else null,
-            expectedZone = "ZoneA",
-            passed = zoneName = expectedZone
+            passed = HasRowWhere(Result, each [layer1][ID] = 1 and [layer2] <> null and (try [layer2][Name] otherwise null) = "ZoneA")
         in
             [
-                passed = passed,
-                errorMessage = if not passed then 
-                    "Point ID=1 should be in ZoneA, found: " & (if zoneName = null then "null" else zoneName)
-                    else "",
-                expected = expectedZone,
-                actual = zoneName,
-                metadata = [Row = row, FullTable = Result]
+                parent = "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisContains...)",
+                description = "Point ID=1 at (5,5) should be contained in ZoneA",
+                tags = {"Spatial Join", "Contains", "Points", "Polygons"},
+                passed = passed
             ],
 
     // Test 1.2: Point ID=2 at (15,5) should be in ZoneB
-    Test1_2_Function = () =>
+    Test1_2 = 
         let
             Result = Test1_Setup,
-            row = FindRow(Result, [layer1 = [ID = 2]]),
-            zoneName = if row <> null and row[layer2] <> null then row[layer2][Name] else null,
-            expectedZone = "ZoneB",
-            passed = zoneName = expectedZone
+            passed = HasRowWhere(Result, each [layer1][ID] = 2 and [layer2] <> null and (try [layer2][Name] otherwise null) = "ZoneB")
         in
             [
-                passed = passed,
-                errorMessage = if not passed then 
-                    "Point ID=2 should be in ZoneB, found: " & (if zoneName = null then "null" else zoneName)
-                    else "",
-                expected = expectedZone,
-                actual = zoneName,
-                metadata = [Row = row]
+                parent = "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisContains...)",
+                description = "Point ID=2 at (15,5) should be contained in ZoneB",
+                tags = {"Spatial Join", "Contains", "Points", "Polygons"},
+                passed = passed
             ],
 
     // Test 1.3: Point ID=3 at (25,5) should not be in any zone
-    Test1_3_Function = () =>
+    Test1_3 = 
         let
             Result = Test1_Setup,
-            row = FindRow(Result, [layer1 = [ID = 3]]),
-            zoneName = if row <> null and row[layer2] <> null then row[layer2][Name] else null,
-            passed = zoneName = null
+            passed = HasRowWhere(Result, each [layer1][ID] = 3 and [layer2] = null)
         in
             [
-                passed = passed,
-                errorMessage = if not passed then 
-                    "Point ID=3 should not be in any zone, found: " & (if zoneName = null then "null" else zoneName)
-                    else "",
-                expected = null,
-                actual = zoneName,
-                metadata = [Row = row]
+                parent = "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisContains...)",
+                description = "Point ID=3 at (25,5) should not be in any zone (null)",
+                tags = {"Spatial Join", "Contains", "Points", "Polygons"},
+                passed = passed
             ],
 
     //===========================================
@@ -179,7 +119,7 @@ let
             Result,
 
     // Test 2.1: ZoneA should contain points (test returns zones that are within points)
-    Test2_1_Function = () =>
+    Test2_1 = 
         let
             Result = Test2_Setup,
             // For Within operator with left outer: each zone should appear for points within it
@@ -190,17 +130,16 @@ let
             passed = rowCount = expectedCount
         in
             [
+                parent = "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisWithin...)",
+                description = "ZoneA should contain 2 points (ID=1 and ID=4)",
+                tags = {"Spatial Join", "Within", "Points", "Polygons"},
                 passed = passed,
-                errorMessage = if not passed then 
-                    "ZoneA should match with 2 points, found: " & Text.From(rowCount)
-                    else "",
                 expected = expectedCount,
-                actual = rowCount,
-                metadata = [ZoneARows = zoneARows, FullTable = Result]
+                actual = rowCount
             ],
 
     // Test 2.2: ZoneB should contain points
-    Test2_2_Function = () =>
+    Test2_2 = 
         let
             Result = Test2_Setup,
             zoneBRows = Table.SelectRows(Result, each [layer1][Name] = "ZoneB"),
@@ -210,13 +149,12 @@ let
             passed = rowCount = expectedCount
         in
             [
+                parent = "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisWithin...)",
+                description = "ZoneB should contain 1 point (ID=2)",
+                tags = {"Spatial Join", "Within", "Points", "Polygons"},
                 passed = passed,
-                errorMessage = if not passed then 
-                    "ZoneB should match with 1 point, found: " & Text.From(rowCount)
-                    else "",
                 expected = expectedCount,
-                actual = rowCount,
-                metadata = [ZoneBRows = zoneBRows]
+                actual = rowCount
             ],
 
     //===========================================
@@ -275,26 +213,20 @@ let
             Result,
 
     // Test 3.1: Sub1 should intersect with ZoneA
-    Test3_1_Function = () =>
+    Test3_1 = 
         let
             Result = Test3_Setup_Intersects,
-            row = FindRow(Result, [layer1 = [SubName = "Sub1"]]),
-            zoneName = if row <> null and row[layer2] <> null then row[layer2][Name] else null,
-            expectedZone = "ZoneA",
-            passed = zoneName = expectedZone
+            passed = HasRowWhere(Result, each [layer1][SubName] = "Sub1" and [layer2] <> null and (try [layer2][Name] otherwise null) = "ZoneA")
         in
             [
-                passed = passed,
-                errorMessage = if not passed then 
-                    "Sub1 should intersect with ZoneA, found: " & (if zoneName = null then "null" else zoneName)
-                    else "",
-                expected = expectedZone,
-                actual = zoneName,
-                metadata = [Row = row, Table = Result]
+                parent = "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisIntersects...)",
+                description = "Sub1 polygon should intersect with ZoneA",
+                tags = {"Spatial Join", "Intersects", "Polygons"},
+                passed = passed
             ],
 
     // Test 3.2: Sub2 should intersect with both ZoneA and ZoneB
-    Test3_2_Function = () =>
+    Test3_2 = 
         let
             Result = Test3_Setup_Intersects,
             sub2Rows = Table.SelectRows(Result, each [layer1][SubName] = "Sub2"),
@@ -303,17 +235,16 @@ let
             passed = rowCount = expectedCount
         in
             [
+                parent = "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisIntersects...)",
+                description = "Sub2 polygon should intersect with both ZoneA and ZoneB (2 rows)",
+                tags = {"Spatial Join", "Intersects", "Polygons"},
                 passed = passed,
-                errorMessage = if not passed then 
-                    "Sub2 should intersect with 2 zones, found: " & Text.From(rowCount)
-                    else "",
                 expected = expectedCount,
-                actual = rowCount,
-                metadata = [Sub2Rows = sub2Rows]
+                actual = rowCount
             ],
 
     // Test 3.3: Sub3 should not intersect with any zone (Inner join)
-    Test3_3_Function = () =>
+    Test3_3 = 
         let
             Result = Test3_Setup_Intersects,
             sub3Rows = Table.SelectRows(Result, each [layer1][SubName] = "Sub3"),
@@ -322,32 +253,25 @@ let
             passed = rowCount = expectedCount
         in
             [
+                parent = "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisIntersects...)",
+                description = "Sub3 polygon should not intersect with any zone (Inner join = 0 rows)",
+                tags = {"Spatial Join", "Intersects", "Polygons"},
                 passed = passed,
-                errorMessage = if not passed then 
-                    "Sub3 should not intersect with any zone, found: " & Text.From(rowCount) & " rows"
-                    else "",
                 expected = expectedCount,
-                actual = rowCount,
-                metadata = [Sub3Rows = sub3Rows]
+                actual = rowCount
             ],
 
     // Test 3.4: Sub1 should be fully contained within ZoneA
-    Test3_4_Function = () =>
+    Test3_4 = 
         let
             Result = Test3_Setup_Contains,
-            row = FindRow(Result, [layer1 = [SubName = "Sub1"]]),
-            zoneName = if row <> null and row[layer2] <> null then row[layer2][Name] else null,
-            expectedZone = "ZoneA",
-            passed = zoneName = expectedZone
+            passed = HasRowWhere(Result, each [layer1][SubName] = "Sub1" and [layer2] <> null and (try [layer2][Name] otherwise null) = "ZoneA")
         in
             [
-                passed = passed,
-                errorMessage = if not passed then 
-                    "Sub1 should be contained within ZoneA, found: " & (if zoneName = null then "null" else zoneName)
-                    else "",
-                expected = expectedZone,
-                actual = zoneName,
-                metadata = [Row = row]
+                parent = "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisContains...)",
+                description = "Sub1 polygon should be fully contained within ZoneA",
+                tags = {"Spatial Join", "Contains", "Polygons"},
+                passed = passed
             ],
 
     //===========================================
@@ -385,98 +309,68 @@ let
             Result,
 
     // Test 4.1: H1 at (1,1) should be nearest to S1 at (0,0)
-    Test4_1_Function = () =>
+    Test4_1 = 
         let
             Result = Test4_Setup,
-            row = FindRow(Result, [layer1 = [HouseID = "H1"]]),
-            nearestShop = if row <> null and row[layer2] <> null then row[layer2][ShopID] else null,
-            expectedShop = "S1",
-            passed = nearestShop = expectedShop
+            passed = HasRowWhere(Result, each [layer1][HouseID] = "H1" and [layer2] <> null and (try [layer2][ShopID] otherwise null) = "S1")
         in
             [
-                passed = passed,
-                errorMessage = if not passed then 
-                    "H1 should be nearest to S1, found: " & (if nearestShop = null then "null" else nearestShop)
-                    else "",
-                expected = expectedShop,
-                actual = nearestShop,
-                metadata = [Row = row, Table = Result]
+                parent = "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisNearest...)",
+                description = "House H1 at (1,1) should be nearest to Shop S1 at (0,0)",
+                tags = {"Spatial Join", "Nearest", "Points", "Distance"},
+                passed = passed
             ],
 
     // Test 4.2: H2 at (4,3) should be nearest to S2 at (5,2)
-    Test4_2_Function = () =>
+    Test4_2 = 
         let
             Result = Test4_Setup,
-            row = FindRow(Result, [layer1 = [HouseID = "H2"]]),
-            nearestShop = if row <> null and row[layer2] <> null then row[layer2][ShopID] else null,
-            expectedShop = "S2",
-            passed = nearestShop = expectedShop
+            passed = HasRowWhere(Result, each [layer1][HouseID] = "H2" and [layer2] <> null and (try [layer2][ShopID] otherwise null) = "S2")
         in
             [
-                passed = passed,
-                errorMessage = if not passed then 
-                    "H2 should be nearest to S2, found: " & (if nearestShop = null then "null" else nearestShop)
-                    else "",
-                expected = expectedShop,
-                actual = nearestShop,
-                metadata = [Row = row]
+                parent = "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisNearest...)",
+                description = "House H2 at (4,3) should be nearest to Shop S2 at (5,2)",
+                tags = {"Spatial Join", "Nearest", "Points", "Distance"},
+                passed = passed
             ],
 
     // Test 4.3: H3 at (9,6) should be nearest to S3 at (10,6)
-    Test4_3_Function = () =>
+    Test4_3 = 
         let
             Result = Test4_Setup,
-            row = FindRow(Result, [layer1 = [HouseID = "H3"]]),
-            nearestShop = if row <> null and row[layer2] <> null then row[layer2][ShopID] else null,
-            expectedShop = "S3",
-            passed = nearestShop = expectedShop
+            passed = HasRowWhere(Result, each [layer1][HouseID] = "H3" and [layer2] <> null and (try [layer2][ShopID] otherwise null) = "S3")
         in
             [
-                passed = passed,
-                errorMessage = if not passed then 
-                    "H3 should be nearest to S3, found: " & (if nearestShop = null then "null" else nearestShop)
-                    else "",
-                expected = expectedShop,
-                actual = nearestShop,
-                metadata = [Row = row]
+                parent = "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisNearest...)",
+                description = "House H3 at (9,6) should be nearest to Shop S3 at (10,6)",
+                tags = {"Spatial Join", "Nearest", "Points", "Distance"},
+                passed = passed
             ],
 
     // Test 4.4: H4 at (14,3) should be nearest to S4 at (15,3)
-    Test4_4_Function = () =>
+    Test4_4 = 
         let
             Result = Test4_Setup,
-            row = FindRow(Result, [layer1 = [HouseID = "H4"]]),
-            nearestShop = if row <> null and row[layer2] <> null then row[layer2][ShopID] else null,
-            expectedShop = "S4",
-            passed = nearestShop = expectedShop
+            passed = HasRowWhere(Result, each [layer1][HouseID] = "H4" and [layer2] <> null and (try [layer2][ShopID] otherwise null) = "S4")
         in
             [
-                passed = passed,
-                errorMessage = if not passed then 
-                    "H4 should be nearest to S4, found: " & (if nearestShop = null then "null" else nearestShop)
-                    else "",
-                expected = expectedShop,
-                actual = nearestShop,
-                metadata = [Row = row]
+                parent = "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisNearest...)",
+                description = "House H4 at (14,3) should be nearest to Shop S4 at (15,3)",
+                tags = {"Spatial Join", "Nearest", "Points", "Distance"},
+                passed = passed
             ],
 
     // Test 4.5: H5 at (18,8) should be nearest to S5 at (20,10)
-    Test4_5_Function = () =>
+    Test4_5 = 
         let
             Result = Test4_Setup,
-            row = FindRow(Result, [layer1 = [HouseID = "H5"]]),
-            nearestShop = if row <> null and row[layer2] <> null then row[layer2][ShopID] else null,
-            expectedShop = "S5",
-            passed = nearestShop = expectedShop
+            passed = HasRowWhere(Result, each [layer1][HouseID] = "H5" and [layer2] <> null and (try [layer2][ShopID] otherwise null) = "S5")
         in
             [
-                passed = passed,
-                errorMessage = if not passed then 
-                    "H5 should be nearest to S5, found: " & (if nearestShop = null then "null" else nearestShop)
-                    else "",
-                expected = expectedShop,
-                actual = nearestShop,
-                metadata = [Row = row]
+                parent = "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisNearest...)",
+                description = "House H5 at (18,8) should be nearest to Shop S5 at (20,10)",
+                tags = {"Spatial Join", "Nearest", "Points", "Distance"},
+                passed = passed
             ],
 
     //===========================================
@@ -490,52 +384,49 @@ let
             layer,
 
     // Test 5.1: Shapefile layer should have table field
-    Test5_1_Function = () =>
+    Test5_1 = 
         let
             layer = Test5_Setup,
             hasTable = Record.HasFields(layer, "table"),
             passed = hasTable
         in
             [
-                passed = passed,
-                errorMessage = if not passed then "Layer missing 'table' field" else "",
-                expected = true,
-                actual = hasTable,
-                metadata = [Layer = layer]
+                parent = "gisLayerCreateFromShapefile",
+                description = "Shapefile layer should have 'table' field",
+                tags = {"Load", "Shapefile"},
+                passed = passed
             ],
 
     // Test 5.2: Shapefile layer should have geometryColumn field
-    Test5_2_Function = () =>
+    Test5_2 = 
         let
             layer = Test5_Setup,
             hasGeometryColumn = Record.HasFields(layer, "geometryColumn"),
             passed = hasGeometryColumn
         in
             [
-                passed = passed,
-                errorMessage = if not passed then "Layer missing 'geometryColumn' field" else "",
-                expected = true,
-                actual = hasGeometryColumn,
-                metadata = [Layer = layer]
+                parent = "gisLayerCreateFromShapefile",
+                description = "Shapefile layer should have 'geometryColumn' field",
+                tags = {"Load", "Shapefile"},
+                passed = passed
             ],
 
     // Test 5.3: Shapefile layer should have queryLayer field
-    Test5_3_Function = () =>
+    Test5_3 = 
         let
             layer = Test5_Setup,
             hasQueryLayer = Record.HasFields(layer, "queryLayer"),
             passed = hasQueryLayer
         in
             [
-                passed = passed,
-                errorMessage = if not passed then "Layer missing 'queryLayer' field" else "",
-                expected = true,
-                actual = hasQueryLayer,
-                metadata = [Layer = layer]
+                parent = "gisLayerCreateFromShapefile",
+                description = "Shapefile layer should have 'queryLayer' field",
+                tags = {"Load", "Shapefile"},
+                passed = passed
             ],
 
     // Test 5.4: Shapefile table should have shape column
-    Test5_4_Function = () =>
+    Test5_4 = 
         let
             layer = Test5_Setup,
             table = layer[table],
@@ -543,15 +434,14 @@ let
             passed = hasShapeColumn
         in
             [
-                passed = passed,
-                errorMessage = if not passed then "Table missing 'shape' column" else "",
-                expected = true,
-                actual = hasShapeColumn,
-                metadata = [TableColumns = Table.ColumnNames(table)]
+                parent = "gisLayerCreateFromShapefile",
+                description = "Shapefile table should have 'shape' column",
+                tags = {"Load", "Shapefile"},
+                passed = passed
             ],
 
     // Test 5.5: Shapefile should have valid shape objects
-    Test5_5_Function = () =>
+    Test5_5 = 
         let
             layer = Test5_Setup,
             table = layer[table],
@@ -564,21 +454,17 @@ let
             passed = shapeIsValid
         in
             [
-                passed = passed,
-                errorMessage = if not passed then 
-                    if rowCount = 0 then "No rows in shapefile"
-                    else "Shape object missing required fields"
-                    else "",
-                expected = true,
-                actual = shapeIsValid,
-                metadata = [
+                parent = "gisLayerCreateFromShapefile",
+                description = "Shapefile should contain valid shape objects with required fields",
+                tags = {"Load", "Shapefile"},
+                passed = passed
                     RowCount = rowCount,
                     FirstShapeKind = if firstShape <> null then firstShape[Kind] else "No shapes"
                 ]
             ],
 
     // Test 5.6: Shapefile projection should be loaded
-    Test5_6_Function = () =>
+    Test5_6 = 
         let
             layer = Test5_Setup,
             hasProjection = Record.HasFields(layer, "TProjection"),
@@ -586,11 +472,10 @@ let
             passed = projectionLoaded
         in
             [
-                passed = passed,
-                errorMessage = if not passed then "Projection not loaded from .prj file" else "",
-                expected = true,
-                actual = projectionLoaded,
-                metadata = [
+                parent = "gisLayerCreateFromShapefile",
+                description = "Shapefile projection should be loaded from .prj file",
+                tags = {"Load", "Shapefile", "Projection"},
+                passed = passed
                     ProjectionData = if projectionLoaded then layer[TProjection][Data] else "No projection file"
                 ]
             ],
@@ -600,178 +485,37 @@ let
     //===========================================
     TestResults = {
         // Test 1: Contains - Points in Polygons
-        RunTest(
-            "Test1.1:Contains_PointInZoneA",
-            Test1_1_Function,
-            "Point ID=1 at (5,5) should be contained in ZoneA",
-            {"Spatial Join", "Contains", "Points", "Polygons"},
-            "Unit",
-            "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisContains...)"
-        ),
-        RunTest(
-            "Test1.2:Contains_PointInZoneB",
-            Test1_2_Function,
-            "Point ID=2 at (15,5) should be contained in ZoneB",
-            {"Spatial Join", "Contains", "Points", "Polygons"},
-            "Unit",
-            "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisContains...)"
-        ),
-        RunTest(
-            "Test1.3:Contains_PointOutsideZones",
-            Test1_3_Function,
-            "Point ID=3 at (25,5) should not be in any zone (null)",
-            {"Spatial Join", "Contains", "Points", "Polygons"},
-            "Unit",
-            "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisContains...)"
-        ),
+        Test1_1,
+        Test1_2,
+        Test1_3,
 
         // Test 2: Within - Reverse Contains
-        RunTest(
-            "Test2.1:Within_ZoneAContainsPoints",
-            Test2_1_Function,
-            "ZoneA should contain 2 points (ID=1 and ID=4)",
-            {"Spatial Join", "Within", "Points", "Polygons"},
-            "Unit",
-            "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisWithin...)"
-        ),
-        RunTest(
-            "Test2.2:Within_ZoneBContainsPoints",
-            Test2_2_Function,
-            "ZoneB should contain 1 point (ID=2)",
-            {"Spatial Join", "Within", "Points", "Polygons"},
-            "Unit",
-            "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisWithin...)"
-        ),
+        Test2_1,
+        Test2_2,
 
         // Test 3: Intersects, Contains, Within with Polygons
-        RunTest(
-            "Test3.1:Intersects_Sub1WithZoneA",
-            Test3_1_Function,
-            "Sub1 polygon should intersect with ZoneA",
-            {"Spatial Join", "Intersects", "Polygons"},
-            "Unit",
-            "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisIntersects...)"
-        ),
-        RunTest(
-            "Test3.2:Intersects_Sub2WithBothZones",
-            Test3_2_Function,
-            "Sub2 polygon should intersect with both ZoneA and ZoneB (2 rows)",
-            {"Spatial Join", "Intersects", "Polygons"},
-            "Unit",
-            "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisIntersects...)"
-        ),
-        RunTest(
-            "Test3.3:Intersects_Sub3WithNoZones",
-            Test3_3_Function,
-            "Sub3 polygon should not intersect with any zone (Inner join = 0 rows)",
-            {"Spatial Join", "Intersects", "Polygons"},
-            "Unit",
-            "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisIntersects...)"
-        ),
-        RunTest(
-            "Test3.4:Contains_Sub1WithinZoneA",
-            Test3_4_Function,
-            "Sub1 polygon should be fully contained within ZoneA",
-            {"Spatial Join", "Contains", "Polygons"},
-            "Unit",
-            "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisContains...)"
-        ),
+        Test3_1,
+        Test3_2,
+        Test3_3,
+        Test3_4,
 
         // Test 4: Nearest Neighbor
-        RunTest(
-            "Test4.1:Nearest_H1ToS1",
-            Test4_1_Function,
-            "House H1 at (1,1) should be nearest to Shop S1 at (0,0)",
-            {"Spatial Join", "Nearest", "Points", "Distance"},
-            "Unit",
-            "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisNearest...)"
-        ),
-        RunTest(
-            "Test4.2:Nearest_H2ToS2",
-            Test4_2_Function,
-            "House H2 at (4,3) should be nearest to Shop S2 at (5,2)",
-            {"Spatial Join", "Nearest", "Points", "Distance"},
-            "Unit",
-            "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisNearest...)"
-        ),
-        RunTest(
-            "Test4.3:Nearest_H3ToS3",
-            Test4_3_Function,
-            "House H3 at (9,6) should be nearest to Shop S3 at (10,6)",
-            {"Spatial Join", "Nearest", "Points", "Distance"},
-            "Unit",
-            "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisNearest...)"
-        ),
-        RunTest(
-            "Test4.4:Nearest_H4ToS4",
-            Test4_4_Function,
-            "House H4 at (14,3) should be nearest to Shop S4 at (15,3)",
-            {"Spatial Join", "Nearest", "Points", "Distance"},
-            "Unit",
-            "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisNearest...)"
-        ),
-        RunTest(
-            "Test4.5:Nearest_H5ToS5",
-            Test4_5_Function,
-            "House H5 at (18,8) should be nearest to Shop S5 at (20,10)",
-            {"Spatial Join", "Nearest", "Points", "Distance"},
-            "Unit",
-            "gisLayerCreateFromTableWithWKT, gisLayerJoinSpatial(...gisNearest...)"
-        ),
+        Test4_1,
+        Test4_2,
+        Test4_3,
+        Test4_4,
+        Test4_5,
 
         // Test 5: Shapefile Loading
-        RunTest(
-            "Test5.1:Shapefile_HasTableField",
-            Test5_1_Function,
-            "Shapefile layer should have 'table' field",
-            {"Load", "Shapefile"},
-            "Unit",
-            "gisLayerCreateFromShapefile"
-        ),
-        RunTest(
-            "Test5.2:Shapefile_HasGeometryColumnField",
-            Test5_2_Function,
-            "Shapefile layer should have 'geometryColumn' field",
-            {"Load", "Shapefile"},
-            "Unit",
-            "gisLayerCreateFromShapefile"
-        ),
-        RunTest(
-            "Test5.3:Shapefile_HasQueryLayerField",
-            Test5_3_Function,
-            "Shapefile layer should have 'queryLayer' field",
-            {"Load", "Shapefile"},
-            "Unit",
-            "gisLayerCreateFromShapefile"
-        ),
-        RunTest(
-            "Test5.4:Shapefile_HasShapeColumn",
-            Test5_4_Function,
-            "Shapefile table should have 'shape' column",
-            {"Load", "Shapefile"},
-            "Unit",
-            "gisLayerCreateFromShapefile"
-        ),
-        RunTest(
-            "Test5.5:Shapefile_ValidShapeObjects",
-            Test5_5_Function,
-            "Shapefile should contain valid shape objects with required fields",
-            {"Load", "Shapefile"},
-            "Unit",
-            "gisLayerCreateFromShapefile"
-        ),
-        RunTest(
-            "Test5.6:Shapefile_ProjectionLoaded",
-            Test5_6_Function,
-            "Shapefile projection should be loaded from .prj file",
-            {"Load", "Shapefile", "Projection"},
-            "Unit",
-            "gisLayerCreateFromShapefile"
-        )
+        Test5_1,
+        Test5_2,
+        Test5_3,
+        Test5_4,
+        Test5_5,
+        Test5_6
     },
 
     // Convert to table
     ResultTable = Table.FromRecords(TestResults)
 in
     ResultTable
-
