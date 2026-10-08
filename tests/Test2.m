@@ -41,4 +41,7 @@ let
     // Read like: shapes of LayerA are within shapes of LayerB (reverse test of Contains)
     Joined = gisLayerJoinSpatial(LayerA, LayerB, gisWithin, "Left Outer")[table]
 in
-    Joined
+    if Table.TransformRows(Joined, each {[layer1][Name], [layer2][ID]})
+        = {{"ZoneA", 1}, {"ZoneA", 4}, {"ZoneB", 2}}
+    then Joined
+    else error "Test2: reversed containment join returned unexpected matches."

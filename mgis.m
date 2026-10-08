@@ -590,6 +590,30 @@ let
         ),
         type function (b1 as TShapeEnvelope, b2 as TShapeEnvelope) as logical
     ),
+
+    // Cache the bounds of all envelope centres below a node. These remain valid
+    // even when root expansion changes the tree's subdivision envelopes.
+    QuadTreeUpdateNearestEnvelope = (node as record) as record =>
+        let
+            ownCentres = List.Transform(node[shapes], (shape) =>
+                let
+                    e = shape[Envelope],
+                    x = (e[MinX] + e[MaxX]) / 2,
+                    y = (e[MinY] + e[MaxY]) / 2
+                in
+                    [MinX = x, MinY = y, MaxX = x, MaxY = y]
+            ),
+            childBounds = if node[children] = null then {} else
+                List.Transform(node[children], each _[nearestEnvelope]),
+            bounds = List.RemoveNulls(ownCentres & childBounds),
+            envelope = if List.IsEmpty(bounds) then null else [
+                MinX = List.Min(List.Transform(bounds, each [MinX])),
+                MinY = List.Min(List.Transform(bounds, each [MinY])),
+                MaxX = List.Max(List.Transform(bounds, each [MaxX])),
+                MaxY = List.Max(List.Transform(bounds, each [MaxY]))
+            ]
+        in
+            Record.Combine({node, [nearestEnvelope = envelope]}),
     //Subdivides a quadtree node into four children (SW, SE, NE, NW)
     //@param node - The node to subdivide
     //@returns - The subdivided node with four children
@@ -601,13 +625,13 @@ let
                 b = node[envelope],
                 children = {
                     // SW
-                    [envelope = [MinX = b[MinX], MinY = b[MinY], MaxX = midX, MaxY = midY], capacity = node[capacity], shapes = {}, children = null],
+                    [envelope = [MinX = b[MinX], MinY = b[MinY], MaxX = midX, MaxY = midY], capacity = node[capacity], shapes = {}, children = null, nearestEnvelope = null],
                     // SE
-                    [envelope = [MinX = midX, MinY = b[MinY], MaxX = b[MaxX], MaxY = midY], capacity = node[capacity], shapes = {}, children = null],
+                    [envelope = [MinX = midX, MinY = b[MinY], MaxX = b[MaxX], MaxY = midY], capacity = node[capacity], shapes = {}, children = null, nearestEnvelope = null],
                     // NE
-                    [envelope = [MinX = midX, MinY = midY, MaxX = b[MaxX], MaxY = b[MaxY]], capacity = node[capacity], shapes = {}, children = null],
+                    [envelope = [MinX = midX, MinY = midY, MaxX = b[MaxX], MaxY = b[MaxY]], capacity = node[capacity], shapes = {}, children = null, nearestEnvelope = null],
                     // NW
-                    [envelope = [MinX = b[MinX], MinY = midY, MaxX = midX, MaxY = b[MaxY]], capacity = node[capacity], shapes = {}, children = null]
+                    [envelope = [MinX = b[MinX], MinY = midY, MaxX = midX, MaxY = b[MaxY]], capacity = node[capacity], shapes = {}, children = null, nearestEnvelope = null]
                 }
             in                
                 if Record.HasFields(node, {"children"}) then
@@ -628,6 +652,7 @@ let
                     shapes = {},
                     capacity = capacity,
                     children = null,
+                    nearestEnvelope = null,
                     envelope = initialEnvelope ?? [
                         MinX = 0,
                         MinY = 0,
@@ -728,7 +753,7 @@ let
 						qx = if cx < midX then 0 else 1,
 						qy = if cy < midY then 0 else 1,
 						idx = if qx = 0 and qy = 0 then 0 else if qx = 1 and qy = 0 then 1 else if qx = 1 and qy = 1 then 2 else 3,
-						makeChild = (env as record) as record => [envelope = env, capacity = node[capacity], shapes = {}, children = null],
+						makeChild = (env as record) as record => [envelope = env, capacity = node[capacity], shapes = {}, children = null, nearestEnvelope = null],
 						baseChildren = List.Transform(quadrants, each @makeChild(_)),
 						updatedChildren = List.Transform({0..3}, (i as number) as record => if i = idx then Record.TransformFields(node, {"envelope", each quadrants{i}}) else baseChildren{i}),
 						newParent = [
@@ -767,7 +792,10 @@ let
                             let
                                 subdivided = QuadTreeSubdivideNode(node),
                                 allShapes = node[shapes] & {shape},
-                                reshaped = List.Accumulate(allShapes, subdivided, insertIntoChildrenOrKeep)
+                                // Move existing shapes into children without retaining
+                                // duplicate copies on the subdivided parent.
+                                cleared = Record.TransformFields(subdivided, {"shapes", each {}}),
+                                reshaped = List.Accumulate(allShapes, cleared, insertIntoChildrenOrKeep)
                             in
                                 reshaped
                     //If the node has children
@@ -775,7 +803,7 @@ let
                         //Insert the shape into the appropriate child
                         insertIntoChildrenOrKeep(node, shape)
             in
-                result
+                QuadTreeUpdateNearestEnvelope(result)
         ),
         type function (node as TQuadTreeNode, shape as TShape, isRoot as logical) as TQuadTreeNode
     ),
@@ -965,11 +993,13 @@ let
                     in
                         bestN,
 
-                continueSearch = (partial as any) as logical => 
-                    // stop when we already collected exactly k = 1 neighbours with dist = 0
-                    if Value.Is(partial, type list) and List.Count(partial) = k then false else true,
+                // Having k candidates does not mean they are the closest k.
+                continueSearch = null,
 
-                additionalColumns = {"dist"}
+                additionalColumns = {"dist"},
+                // Extra traversal metadata; kept out of the record type because
+                // Value.ReplaceType requires the existing operators' exact fields.
+                nearestCount = k
             ],
             type function (k as number) as TQuadTreeQueryOperator
     ),
@@ -1066,6 +1096,41 @@ let
 
         type function (node as TQuadTreeNode, shape as TShape, operator as TQuadTreeQueryOperator) as any
     ),
+
+    // Branch-and-bound nearest search. Visit the closest child first, carrying
+    // the best k candidates forward so farther subtrees can be skipped entirely.
+    QuadTreeQueryNearest = (node as record, shape as record, operator as record) as list =>
+        let
+            k = operator[nearestCount],
+            e = shape[Envelope],
+            x = (e[MinX] + e[MaxX]) / 2,
+            y = (e[MinY] + e[MaxY]) / 2,
+            minimumDistance = (current as record) as nullable number =>
+                let
+                    bounds = Record.FieldOrDefault(current, "nearestEnvelope", current[envelope]),
+                    dx = if bounds = null then 0 else List.Max({bounds[MinX] - x, 0, x - bounds[MaxX]}),
+                    dy = if bounds = null then 0 else List.Max({bounds[MinY] - y, 0, y - bounds[MaxY]})
+                in
+                    if bounds = null then null else Number.Sqrt(dx * dx + dy * dy),
+            search = (current as record, best as list, lowerBound as nullable number) as list =>
+                if lowerBound = null then best
+                else if List.Count(best) = k and lowerBound > List.Last(best)[dist] then best
+                else
+                    let
+                        candidates = List.Transform(current[shapes], each operator[onCandidate](_, shape)),
+                        updatedBest = operator[combine]({best, candidates}),
+                        children = if current[children] = null then {} else current[children],
+                        orderedChildren = List.Sort(
+                            List.Transform(children, each [node = _, lowerBound = minimumDistance(_)]),
+                            each [lowerBound]
+                        )
+                    in
+                        List.Accumulate(orderedChildren, updatedBest, (state, child) =>
+                            @search(child[node], state, child[lowerBound])
+                        )
+        in
+            if k = 0 then {}
+            else search(node, {}, minimumDistance(node)),
     
 	//Queries a quadtree based on a spatial relationship to a supplied shape
 	//@param qt - The quadtree to query
@@ -1075,7 +1140,10 @@ let
 	QuadTreeQuery = Value.ReplaceType(
         (qt as record, shape as record, op as record) as list =>
             let
-                res = QuadTreeNodeQuery(qt[root], shape, op),
+                res = if Record.HasFields(op, "nearestCount") then
+                    QuadTreeQueryNearest(qt[root], shape, op)
+                else
+                    QuadTreeNodeQuery(qt[root], shape, op),
                 listOut = NormalizeList(res)
             in
                 listOut,

@@ -56,4 +56,9 @@ let
             {"NearestShopID"}
         )
 in
-    Expanded
+    if Table.TransformRows(Expanded, each {[HouseID], [NearestShopID]})
+        = {{"H1", "S1"}, {"H2", "S2"}, {"H3", "S3"}, {"H4", "S4"}, {"H5", "S5"}}
+        and List.AllTrue(List.Transform(List.Zip({Expanded[dist], {Number.Sqrt(2), Number.Sqrt(2), 1, 1, Number.Sqrt(8)}}),
+            each Number.Abs(_{0} - _{1}) < 0.000000001))
+    then Expanded
+    else error "Test4: nearest-shop join returned unexpected matches or distances."

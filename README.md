@@ -87,8 +87,8 @@ Access operators via `GISLib[gisLayerQueryOperators]`:
 - **`gisIntersects`** - Returns shapes whose envelopes intersect the query shape
 - **`gisContains`** - Returns shapes whose envelopes contain the query shape
 - **`gisWithin`** - Returns shapes whose envelopes are within the query shape
-- **`gisNearest`** - Returns the single nearest shape
-- **`gisNearestN(k as number)`** - Returns k nearest shapes
+- **`gisNearest`** - Returns the single nearest shape by envelope-centre distance
+- **`gisNearestN(k as number)`** - Returns up to k nearest shapes by envelope-centre distance
 
 ### Layer Operations
 
@@ -253,6 +253,23 @@ in
 
 **Result:** A table showing each house and its nearest shop, including the distance.
 
+To keep only nearest matches within 10 metres, use coordinates in the same projected coordinate system with metre units:
+
+```powerquery
+let
+    Joined = mgis[gisLayerJoinSpatial](
+        HousesLayer,
+        ShopsLayer,
+        mgis[gisLayerQueryOperators][gisNearest],
+        "Inner"
+    ),
+    Within10m = Table.SelectRows(Joined[table], each [dist] <= 10)
+in
+    Within10m
+```
+
+This returns only houses with a nearest shop at most 10 metres away. Distances use the supplied coordinate units without reprojection; longitude/latitude degrees are not metres. For points the distance is the straight-line distance; for lines and polygons it is the distance between bounding-box centres.
+
 ### Example 4: Within Operator
 
 Find zones that are within sub-zones (reverse containment).
@@ -302,7 +319,7 @@ The library supports four join types:
 
 1. **Envelope-based queries**: All spatial operators (`gisIntersects`, `gisContains`, `gisWithin`) currently perform envelope-based tests, not true geometric operations. This means they test bounding boxes, not the actual geometry shapes.
 
-2. **Performance**: The library uses a QuadTree spatial index for efficient querying. For best performance with large datasets, ensure appropriate capacity settings when creating layers.
+2. **Performance**: The library uses a QuadTree spatial index for efficient querying. For best performance with large datasets, ensure appropriate capacity settings when creating layers. Nearest-neighbour operators use branch-and-bound traversal: visit closer cells first and skip subtrees whose cached envelope-centre bounds cannot improve the current nearest k results. Queries outside the indexed extent are supported.
 
 3. **Row IDs**: The library automatically manages `__rowid__` columns for internal tracking. You don't need to create these manually.
 
@@ -319,6 +336,18 @@ The library supports four join types:
 - **Logistics**: Route optimization, service area analysis
 - **Environmental**: Habitat analysis, pollution zone mapping
 - **Real Estate**: Property location analysis, market area definitions
+
+## Tests
+
+Run all M test queries with the installed Excel Power Query engine:
+
+```powershell
+pwsh -NoProfile -File .\tests\TestAll.ps1
+```
+
+The runner requires Windows and an installed Power Query engine. It automatically uses Windows PowerShell for the .NET Framework engine, fully evaluates each result, and exits with code 1 if any assertion or query fails. Use `-EnginePath` to specify another compatible `Microsoft.MashupEngine.dll` installation, or `-LibraryPath` to test another copy of `mgis.m`.
+
+Tests 1–4 assert the expected matches and distances while still returning example tables. Tests 5–6 cover XY layer creation and nearest-neighbour regressions, including agreement with exhaustive distances and proof that distant branches are pruned.
 
 ## Contributing
 

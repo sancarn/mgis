@@ -106,4 +106,10 @@ let
     //---------------------------------------
     Combined = Table.Combine({rIntersects, rContains, rWithin})
 in
-    Combined
+    if Table.TransformRows(rIntersects, each {[Sub], [Zone]})
+        = {{"Sub1", "ZoneA"}, {"Sub2", "ZoneA"}, {"Sub2", "ZoneB"}}
+        and Table.TransformRows(rContains, each {[Sub], [Zone]}) = {{"Sub1", "ZoneA"}}
+        and Table.TransformRows(rWithin, each {[Sub], [Zone]}) = {{"Sub1", "ZoneA"}}
+        and Table.RowCount(Combined) = 5
+    then Combined
+    else error "Test3: polygon intersection or containment returned unexpected matches."

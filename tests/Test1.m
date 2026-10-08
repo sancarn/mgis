@@ -43,4 +43,7 @@ let
     // Read like: shapes of LayerB (points) are within shapes of LayerA (polygons)
     Joined = gisLayerJoinSpatial(LayerB, LayerA, gisContains, "Left Outer")[table]
 in
-    Joined
+    if Table.TransformRows(Joined, each {[layer1][ID], if [layer2] = null then null else [layer2][Name]})
+        = {{1, "ZoneA"}, {2, "ZoneB"}, {3, null}}
+    then Joined
+    else error "Test1: point-in-polygon left join returned unexpected matches."
