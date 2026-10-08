@@ -54,13 +54,19 @@ try {
     $hostApi = [Microsoft.Mashup.Evaluator.MinimalEngineHost]::Instance
     $library = [Microsoft.Mashup.Engine.Interface.IEngine].GetMethod('GetLibrary').Invoke($engine, @($hostApi, $null))
     $source = [IO.File]::ReadAllText($LibraryPath)
+    # Numerical fixtures are committed M literals; no reference-engine dependency
+    # is needed to run the tests or use the library.
+    $referencePath = Join-Path $TestsDirectory 'data\projection-references.m'
+    $projectionReferences = if (Test-Path -LiteralPath $referencePath) {
+        [IO.File]::ReadAllText($referencePath)
+    } else { 'null' }
     $tests = @(Get-ChildItem -LiteralPath $TestsDirectory -Filter 'Test*.m' -File | Sort-Object Name)
     if ($tests.Count -eq 0) { throw 'No Test*.m queries found.' }
 
     $failures = 0
     foreach ($test in $tests) {
         $testSource = [IO.File]::ReadAllText($test.FullName)
-        $query = 'let mgis = (' + $source + '), result = (' + $testSource + ') in Binary.Length(Json.FromValue(result))'
+        $query = 'let mgis = (' + $source + '), projectionReferences = (' + $projectionReferences + '), result = (' + $testSource + ') in Binary.Length(Json.FromValue(result))'
         try {
             $value = [Microsoft.Mashup.Engine1.Language.LanguageLibrary]::Evaluate($query, $library)
             Write-Output ($test.Name + ': PASS (' + $value.ToString() + ' serialized bytes)')
