@@ -1174,6 +1174,33 @@ let
         type function (tbl as table, wktColumn as text) as TLayer
     ),
 
+    //Creates a point layer from a table with numeric X and Y coordinate columns
+    //@param tbl - The table to create the layer from
+    //@param xColumn - The column name that contains X coordinates
+    //@param yColumn - The column name that contains Y coordinates
+    //@returns - The created layer with the original columns and a new shape column
+    LayerCreateFromTableWithXY = Value.ReplaceType(
+        (tbl as table, xColumn as text, yColumn as text) as record => (
+            let
+                validatedTable =
+                    if not Table.HasColumns(tbl, {xColumn, yColumn}) then
+                        error "Table must contain the coordinate columns " & xColumn & " and " & yColumn & "."
+                    else if Table.HasColumns(tbl, {"shape"}) then
+                        error "Table already has a column named shape. Rename it before creating a layer from XY coordinates."
+                    else
+                        tbl,
+                tblWithShapes = Table.AddColumn(
+                    validatedTable,
+                    "shape",
+                    each ShapeCreatePointFromLatLng(Record.Field(_, yColumn), Record.Field(_, xColumn)),
+                    type record
+                )
+            in
+                LayerCreateFromTable(tblWithShapes, "shape")
+        ),
+        type function (tbl as table, xColumn as text, yColumn as text) as TLayer
+    ),
+
     //Inserts rows into a layer and updates the spatial index
     //@param layer - The layer to insert the rows into
     //@param rows as List<Record> - The list of records (rows) to insert
@@ -1574,6 +1601,7 @@ in
         gisLayerCreateBlank = LayerCreateBlank,
         gisLayerCreateFromTable = LayerCreateFromTable,
         gisLayerCreateFromTableWithWKT = LayerCreateFromTableWithWKT,
+        gisLayerCreateFromTableWithXY = LayerCreateFromTableWithXY,
         gisLayerQuerySpatial = LayerQuerySpatial,
         gisLayerQueryRelational = LayerQueryRelational,
         gisLayerQueryOperators = [

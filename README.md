@@ -64,6 +64,22 @@ Creates a layer from a table with WKT text in the specified column.
 Layer = GISLib[gisLayerCreateFromTableWithWKT](MyTable, "shape")
 ```
 
+#### `gisLayerCreateFromTableWithXY(table as table, xColumn as text, yColumn as text)`
+Creates a point layer from numeric X and Y columns. Preserves the original columns and adds a `shape` column plus the usual row IDs and spatial index. X is longitude/easting; Y is latitude/northing. Coordinates are used as supplied, without reprojection.
+
+Both coordinate columns must exist and contain non-null numbers. The input table must not already contain a `shape` column.
+
+```powerquery
+let
+    MyTable = #table(
+        {"Name", "XColName", "YColName"},
+        {{"Location A", 5, 10}, {"Location B", 15, 20}}
+    ),
+    MyLayer = mgis[gisLayerCreateFromTableWithXY](MyTable, "XColName", "YColName")
+in
+    MyLayer[table]
+```
+
 ### Spatial Query Operators
 
 Access operators via `GISLib[gisLayerQueryOperators]`:
