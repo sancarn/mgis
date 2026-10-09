@@ -12,9 +12,9 @@ let
     emptyJSON = loadJSON(testRepositoryRoot & "/tests/data/geojson/empty.json"),
     shapefile = loadShape(shpPath, wgs),
     unspecified = loadShape(shpPath),
-    // Numerical reprojection is exercised through GeoJSON. The master branch's
-    // shapefile double reader has a separate, pre-existing byte-order bug.
-    projected = mgis[gisLayerReproject](geographic, web),
+    // Shapefile and GeoJSON fixtures independently store the same coordinates.
+    // Exercise the binary coordinates through projection and spatial indexing.
+    projected = mgis[gisLayerReproject](shapefile, web),
     joined = mgis[gisLayerJoinSpatial](geographic, projected,
         mgis[gisLayerQueryOperators][gisNearest], "Inner"),
     geometries = {
@@ -40,6 +40,10 @@ let
             testRepositoryRoot & "/tests/data/geojson/not-a-collection.json")[table]))[HasError],
         ShapefileExplicitCRS = shapefile[TProjection] = wgs
             and Table.RowCount(shapefile[table]) = 3,
+        ShapefileCoordinates = List.AllTrue(List.Transform({0..2}, (i) =>
+            shapefile[table]{i}[shape][Geometry] = geographic[table]{i}[shape][Geometry])),
+        ShapefileEnvelopes = List.AllTrue(List.Transform({0..2}, (i) =>
+            shapefile[table]{i}[shape][Envelope] = geographic[table]{i}[shape][Envelope])),
         ShapefileWKTMetadata = Text.StartsWith(shapefile[projectionWKT], "GEOGCS[")
             and unspecified[projectionWKT] = shapefile[projectionWKT],
         ShapefileWithoutAnalysisCRS = unspecified[TProjection] = null

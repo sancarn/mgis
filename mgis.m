@@ -1860,7 +1860,7 @@ let
     ShapefileReadDoubleLE = (buffer as binary, offset as number) as number =>
         let
             bytes = Binary.Range(buffer, offset, 8),
-            format = BinaryFormat.Double,
+            format = BinaryFormat.ByteOrder(BinaryFormat.Double, ByteOrder.LittleEndian),
             value = format(bytes)
         in
             value,

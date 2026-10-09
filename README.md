@@ -492,7 +492,10 @@ The runner requires Windows and an installed Power Query engine. It automaticall
 Tests 1–4 assert the expected matches and distances while still returning example tables. Tests 5–6 cover XY layer creation and nearest-neighbour regressions, including agreement with exhaustive distances and proof that distant branches are pruned. The separate `Test1Projected.m` through `Test6Projected.m` companions repeat these scenarios with declared CRSs while leaving the originals as null-CRS regressions. They cover mixed EPSG:3857/EPSG:4326 joins, metre distances from feet-based analysis, geographic XY creation, and every nearest-neighbour/pruning regression in both metre and feet units. Tests 7–9 cover independent projection/geodesic references, PROJJSON and PROJ4 validation, mixed-CRS queries and joins, metre units, geometry reprojection, GeoJSON, date-line and polar searches, duplicate points, and explicit proof of geodesic branch pruning.
 
 `UnitTests.m` retains the consolidated suite from master, and `Test10.m` checks
-file-loader integration with projections. The isolated engine host cannot access
+file-loader integration with projections, exact shapefile coordinates and
+envelopes, and nearest joins against matching GeoJSON fixtures. `Test11.m` checks
+EPSG.io PROJ4 exports and null-grid shifts; `Test12.m` checks PROJJSON spheres
+with numeric and unit-bearing radii. The isolated engine host cannot access
 files directly, so the runner supplies `File.Contents` with the committed bytes
 under `tests/data`; the library's actual loaders and binary/JSON parsers run on
 those fixtures. `testRepositoryRoot` supplies a portable fixture path.
