@@ -716,8 +716,14 @@ let
             obj=if Value.Is(json,type text) then Json.Document(json) else json,
             geographic=obj[type]="GeographicCRS", base=if geographic then obj else obj[base_crs],
             datum=if Record.HasFields(base,"datum") then base[datum] else base[datum_ensemble],
-            ell0=datum[ellipsoid], a=ell0[semi_major_axis],
-            rf=if Record.HasFields(ell0,"inverse_flattening") then ell0[inverse_flattening]
+            ell0=datum[ellipsoid], spherical=Record.HasFields(ell0,"radius"),
+            radius=if not spherical then null
+                else if List.AnyTrue(List.Transform({"semi_major_axis","semi_minor_axis","inverse_flattening"},each Record.HasFields(ell0,_))) then
+                    ProjError("A PROJJSON sphere must use radius without ellipsoid axis or flattening parameters.")
+                else if Value.Is(ell0[radius],type record) then ell0[radius][value]*ProjJSONUnit(Record.FieldOrDefault(ell0[radius],"unit","metre"),false)
+                else ell0[radius],
+            a=if spherical then radius else ell0[semi_major_axis],
+            rf=if spherical then 0 else if Record.HasFields(ell0,"inverse_flattening") then ell0[inverse_flattening]
                 else if ell0[semi_minor_axis]=a then 0 else a/(a-ell0[semi_minor_axis]),
             ell=ProjEllipsoid(a,rf),
             id=Record.FieldOrDefault(datum,"id",null),

@@ -128,6 +128,8 @@ The engine does not yet implement every EPSG CRS or every projection family.
 Supported linear units include metres, kilometres, centimetres, millimetres,
 international feet and US survey feet, plus explicit PROJ4 `+to_meter` factors.
 Custom ellipsoids accept `+a` with `+rf`, `+f` or `+b`, or a spherical `+R`.
+PROJJSON spheres accept an ellipsoid `radius`, either a number in metres or a
+`{"value": ..., "unit": ...}` quantity, and normalize it to equal axes and zero flattening.
 Unsupported parameters, methods, axis directions, non-Greenwich prime meridians
 and non-2D PROJJSON CRSs produce errors rather than being silently ignored.
 
