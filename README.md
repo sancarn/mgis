@@ -135,8 +135,10 @@ Datum changes use explicit three- or seven-parameter position-vector Helmert
 operations through WGS84. Approximate operations require
 `[allowApproximateDatum=true]`; this includes the built-in OSGB36 Helmert operation.
 The EPSG:27700 definition can be used for same-datum projection without this option.
-PROJ4 `+nadgrids` references are retained, but grid files are not decoded yet and
-required grids never silently fall back to Helmert. For a custom grid or another
+PROJ4 accepts the `+wktext` metadata flag used by EPSG.io exports. A sole
+`+nadgrids=null` or `+nadgrids=@null` declares an identity datum shift. Other
+`+nadgrids` references are retained, but grid files are not decoded yet and
+grid lists never silently fall back to an identity shift or Helmert. For a custom grid or another
 datum operation, `mgis[proj][withDatumTransform](crs, intoWGS84, fromWGS84)` attaches
 two pure-M functions. Each accepts and returns
 `{longitudeRadians, latitudeRadians, ellipsoidalHeightMetres}`; they must implement

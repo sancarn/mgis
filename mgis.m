@@ -637,7 +637,7 @@ let
             tokens=List.Select(Text.SplitAny(Text.Trim(text)," " & Character.FromNumber(9) & Character.FromNumber(10) & Character.FromNumber(13)),each _<>""),
             names=List.Transform(tokens,each Text.BeforeDelimiter(Text.TrimStart(_,"+") & "=","=")),
             values=List.Transform(tokens,each if Text.Contains(_,"=") then Text.AfterDelimiter(_,"=") else "true"),
-            supported={"proj","datum","ellps","a","b","rf","f","R","lat_0","lon_0","lat_1","lat_2","lat_ts","k","k_0","x_0","y_0","units","to_meter","towgs84","nadgrids","no_defs","type","zone","south","axis","pm"},
+            supported={"proj","datum","ellps","a","b","rf","f","R","lat_0","lon_0","lat_1","lat_2","lat_ts","k","k_0","x_0","y_0","units","to_meter","towgs84","nadgrids","no_defs","wktext","type","zone","south","axis","pm"},
             raw=if List.IsEmpty(tokens) or List.AnyTrue(List.Transform(tokens,each not Text.StartsWith(_,"+"))) then ProjError("Expected a +key=value PROJ4 definition.")
                 else if List.Count(List.Distinct(names))<>List.Count(names) then ProjError("Duplicate PROJ4 parameter.")
                 else if not List.IsEmpty(List.Difference(names,supported)) then ProjError("Unsupported PROJ4 parameters: " & Text.Combine(List.Difference(names,supported),", "))
@@ -810,8 +810,9 @@ let
         in if callback<>null then let result=callback(ll) in
                 if List.Count(ProjCoordinate(result))<>3 or Number.Abs(result{1})>ProjPi/2 then
                     ProjError("A datum callback must return three finite coordinates with latitude in radians.") else result
-            else if grid<>null and grid<>"null" then ProjError("This CRS requires a datum grid: " & grid & ". Supply a pure-M datum transform with proj[withDatumTransform]; grid files are not decoded automatically.")
-            else if grid="null" then ll
+            // A sole null grid declares an identity shift, including EPSG.io's @null spelling.
+            else if List.Contains({"null","@null"},grid) then ll
+            else if grid<>null then ProjError("This CRS requires a datum grid: " & grid & ". Supply a pure-M datum transform with proj[withDatumTransform]; grid files are not decoded automatically.")
             else if crs[DatumKey]="WGS84" and operation<>null and List.AllTrue(List.Transform(operation,each _=0)) then ll
             else if operation=null then ProjError("No transformation to WGS84 is defined for datum " & crs[DatumKey] & ".")
             else if crs[ApproximateDatum] and not allow then ProjError("This datum transformation is approximate. Set allowApproximateDatum=true explicitly to use its Helmert parameters.")
