@@ -1,7 +1,7 @@
 let
     // --- Load GIS Library ---
     GISLib = mgis,
-    githubFolder = "C:/Users/Admin/Documents/GitHub",
+    repositoryRoot = try testRepositoryRoot otherwise "C:/Users/Admin/Documents/GitHub/mgis",
     
     // --- Helper to check if table has at least one row matching a condition ---
     HasRowWhere = (tbl as table, condition as function) as logical =>
@@ -378,8 +378,8 @@ let
     //===========================================
     Test5_Setup = 
         let
-            shapefilePath = githubFolder & "/mgis/tests/data/shape/POINT.shp",
-            layer = gisLayerCreateFromShapefile(shapefilePath)
+            shapefilePath = repositoryRoot & "/tests/data/shape/POINT.shp",
+            layer = gisLayerCreateFromShapefile(shapefilePath, GISLib[proj][fromEPSG][#"EPSG:4326"])
         in
             layer,
 
@@ -465,12 +465,13 @@ let
         let
             layer = Test5_Setup,
             hasProjection = Record.HasFields(layer, "TProjection"),
-            projectionLoaded = hasProjection and layer[TProjection] <> null,
+            projectionLoaded = hasProjection and layer[TProjection] = GISLib[proj][fromEPSG][#"EPSG:4326"]
+                and layer[projectionWKT] <> null,
             passed = projectionLoaded
         in
             [
                 parent = "gisLayerCreateFromShapefile",
-                description = "Shapefile projection should be loaded from .prj file",
+                description = "Shapefile should preserve .prj WKT and use the explicitly supplied analysis CRS",
                 tags = {"Load", "Shapefile", "Projection"},
                 passed = passed
             ],

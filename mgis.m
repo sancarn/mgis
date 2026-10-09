@@ -479,11 +479,434 @@ let
         Envelope = TShapeEnvelope,
         __rowid__ = nullable number
     ],
-    TProjection = type [
-        Name = text,
-        data = any
-        //TODO: Add more projection properties
+    TProjection = type record,
+
+    //**************************************************
+    // Pure-M coordinate reference systems and projections
+    // Coordinates use GIS order: X=longitude/easting, Y=latitude/northing.
+    // Angles in CRS definitions are degrees; projection kernels use radians.
+    // See tests/data/projection-references.m for independent reference values.
+    //**************************************************
+    ProjPi = Number.PI,
+    ProjRadians = Number.PI / 180,
+    ProjError = (message as text) => error Error.Record("ProjectionError", message, null),
+    ProjFinite = (x as any) as logical => Value.Is(x, type number)
+        and not Number.IsNaN(x) and x <> #infinity and x <> -#infinity,
+    ProjWrap = (x as number) as number => x - 2 * ProjPi * Number.RoundDown((x + ProjPi) / (2 * ProjPi)),
+    ProjAsinh = (x as number) as number => Number.Sign(x) * Number.Ln(Number.Abs(x) + Number.Sqrt(x*x + 1)),
+    ProjAtanh = (x as number) as number => Number.Ln((1+x)/(1-x))/2,
+    ProjSinh = (x as number) as number => (Number.Exp(x) - Number.Exp(-x))/2,
+    ProjCosh = (x as number) as number => (Number.Exp(x) + Number.Exp(-x))/2,
+    ProjSolve = (initial as number, step as function, tolerance as number, limit as number) as number =>
+        let
+            // Buffer scalar state: an unconverged lazy record chain can otherwise
+            // repeatedly evaluate earlier iterations in the Power Query engine.
+            result = List.Accumulate({1..limit}, List.Buffer({initial,false}), (state, i) =>
+                if state{1} then state else
+                let next = step(state{0}) in
+                    List.Buffer({next,Number.Abs(next-state{0}) <= tolerance}))
+        in if result{1} and ProjFinite(result{0}) then result{0}
+            else ProjError("Numerical iteration did not converge within its supported domain."),
+    ProjEllipsoid = (a as number, rf as number) as record =>
+        if not ProjFinite(a) or a <= 0 or not ProjFinite(rf) or (rf <> 0 and rf <= 1) then
+            ProjError("Invalid ellipsoid: require a > 0 and inverse flattening > 1 (or 0 for a sphere).")
+        else let f = if rf = 0 then 0 else 1/rf in
+            [a=a, rf=rf, f=f, b=a*(1-f), e2=f*(2-f), e=Number.Sqrt(f*(2-f))],
+    ProjEllipsoids = [
+        WGS84 = ProjEllipsoid(6378137, 298.257223563),
+        GRS80 = ProjEllipsoid(6378137, 298.257222101),
+        airy = ProjEllipsoid(6377563.396, 299.3249646),
+        intl = ProjEllipsoid(6378388, 297),
+        bessel = ProjEllipsoid(6377397.155, 299.1528128),
+        clrk66 = ProjEllipsoid(6378206.4, 294.978698214),
+        sphere = ProjEllipsoid(6370997, 0)
     ],
+    ProjDatums = [
+        WGS84 = [ellipsoid=ProjEllipsoids[WGS84], toWGS84={0,0,0}, approximate=false],
+        OSGB36 = [ellipsoid=ProjEllipsoids[airy], toWGS84={446.448,-125.157,542.060,0.1502,0.2470,0.8421,-20.4894}, approximate=true],
+        NAD83 = [ellipsoid=ProjEllipsoids[GRS80], toWGS84=null, approximate=false]
+    ],
+    ProjUnits = [m=1, km=1000, cm=0.01, mm=0.001, ft=0.3048, #"us-ft"=1200/3937],
+    ProjIsometric = (phi as number, ell as record) as number =>
+        ProjAsinh(Number.Tan(phi)) - ell[e]*ProjAtanh(ell[e]*Number.Sin(phi)),
+    ProjPhi = (q as number, ell as record) as number =>
+        ProjSolve(2*Number.Atan(Number.Exp(q))-ProjPi/2,
+            (phi) => 2*Number.Atan(Number.Exp(q+ell[e]*ProjAtanh(ell[e]*Number.Sin(phi))))-ProjPi/2,
+            1e-13, 30),
+
+    // Sixth-order Krueger series, with explicit domain checks rather than a
+    // low-order TM approximation silently diverging far from the central meridian.
+    ProjTMConstants = (ell as record) as record =>
+        let
+            n=ell[f]/(2-ell[f]), n2=n*n, n3=n2*n, n4=n3*n, n5=n4*n, n6=n5*n,
+            alpha={
+                n/2-2*n2/3+5*n3/16+41*n4/180-127*n5/288+7891*n6/37800,
+                13*n2/48-3*n3/5+557*n4/1440+281*n5/630-1983433*n6/1935360,
+                61*n3/240-103*n4/140+15061*n5/26880+167603*n6/181440,
+                49561*n4/161280-179*n5/168+6601661*n6/7257600,
+                34729*n5/80640-3418889*n6/1995840, 212378941*n6/319334400},
+            beta={
+                n/2-2*n2/3+37*n3/96-n4/360-81*n5/512+96199*n6/604800,
+                n2/48+n3/15-437*n4/1440+46*n5/105-1118711*n6/3870720,
+                17*n3/480-37*n4/840-209*n5/4480+5569*n6/90720,
+                4397*n4/161280-11*n5/504-830251*n6/7257600,
+                4583*n5/161280-108847*n6/3991680, 20648693*n6/638668800}
+        in [A=ell[a]/(1+n)*(1+n2/4+n4/64+n6/256), alpha=alpha, beta=beta],
+    ProjTMRaw = (lambda as number, phi as number, ell as record, c as record) as list =>
+        let
+            tau=Number.Tan(phi), sigma=ProjSinh(ell[e]*ProjAtanh(ell[e]*tau/Number.Sqrt(1+tau*tau))),
+            tauPrime=tau*Number.Sqrt(1+sigma*sigma)-sigma*Number.Sqrt(1+tau*tau),
+            xi=Number.Atan2(tauPrime, Number.Cos(lambda)),
+            eta=ProjAsinh(Number.Sin(lambda)/Number.Sqrt(tauPrime*tauPrime+Number.Power(Number.Cos(lambda),2))),
+            dx=List.Sum(List.Transform({1..6}, (j) => c[alpha]{j-1}*Number.Sin(2*j*xi)*ProjCosh(2*j*eta))),
+            dy=List.Sum(List.Transform({1..6}, (j) => c[alpha]{j-1}*Number.Cos(2*j*xi)*ProjSinh(2*j*eta)))
+        in if Number.Abs(lambda) >= ProjPi/2 or Number.Abs(eta)>1 then
+            ProjError("Transverse Mercator coordinate is outside the supported series domain (|eta| <= 1, front hemisphere).")
+            else {xi+dx, eta+dy},
+    ProjLCCConstants = (p as record, ell as record) as record =>
+        let
+            phi1=p[lat1]*ProjRadians, phi2=p[lat2]*ProjRadians,
+            m=(phi) => Number.Cos(phi)/Number.Sqrt(1-ell[e2]*Number.Power(Number.Sin(phi),2)),
+            t=(phi) => Number.Exp(-ProjIsometric(phi,ell)),
+            n=if Number.Abs(phi1-phi2)<1e-12 then Number.Sin(phi1)
+                else Number.Ln(m(phi1)/m(phi2))/Number.Ln(t(phi1)/t(phi2)),
+            F=m(phi1)/(n*Number.Power(t(phi1),n)),
+            rho0=ell[a]*p[k]*F*Number.Power(t(p[lat0]*ProjRadians),n)
+        in if Number.Abs(n)<1e-12 then ProjError("Lambert Conformal Conic requires non-degenerate standard parallels.")
+            else [n=n,F=F,rho0=rho0],
+
+    // Family registry: adding a projection does not require changing layer/join code.
+    ProjMethods = [
+        longlat = [
+            forward=(ll,p,ell) => ll,
+            inverse=(xy,p,ell) => xy
+        ],
+        merc = [
+            forward=(ll,p,ell) => {ell[a]*p[k]*ProjWrap(ll{0}-p[lon0]*ProjRadians), ell[a]*p[k]*ProjIsometric(ll{1},ell)},
+            inverse=(xy,p,ell) => {ProjWrap(xy{0}/(ell[a]*p[k])+p[lon0]*ProjRadians), ProjPhi(xy{1}/(ell[a]*p[k]),ell)}
+        ],
+        tmerc = [
+            forward=(ll,p,ell) => let
+                c=ProjTMConstants(ell), origin=ProjTMRaw(0,p[lat0]*ProjRadians,ell,c),
+                v=ProjTMRaw(ProjWrap(ll{0}-p[lon0]*ProjRadians),ll{1},ell,c)
+                in {p[k]*c[A]*v{1},p[k]*c[A]*(v{0}-origin{0})},
+            inverse=(xy,p,ell) => let
+                c=ProjTMConstants(ell), origin=ProjTMRaw(0,p[lat0]*ProjRadians,ell,c),
+                xi=xy{1}/(p[k]*c[A])+origin{0}, eta=xy{0}/(p[k]*c[A]),
+                xp=xi-List.Sum(List.Transform({1..6},(j)=>c[beta]{j-1}*Number.Sin(2*j*xi)*ProjCosh(2*j*eta))),
+                ep=eta-List.Sum(List.Transform({1..6},(j)=>c[beta]{j-1}*Number.Cos(2*j*xi)*ProjSinh(2*j*eta))),
+                lambda=Number.Atan2(ProjSinh(ep),Number.Cos(xp)),
+                tau=Number.Sin(xp)/Number.Sqrt(Number.Power(ProjSinh(ep),2)+Number.Power(Number.Cos(xp),2)),
+                phi=ProjPhi(ProjAsinh(tau),ell)
+                in if Number.Abs(eta)>1.1 or Number.Abs(ep)>1 or Number.Abs(lambda)>=ProjPi/2 then
+                    ProjError("Transverse Mercator coordinate is outside the supported inverse domain.")
+                    else {ProjWrap(lambda+p[lon0]*ProjRadians),phi}
+        ],
+        lcc = [
+            forward=(ll,p,ell) => let
+                c=ProjLCCConstants(p,ell), theta=c[n]*ProjWrap(ll{0}-p[lon0]*ProjRadians),
+                rho=ell[a]*p[k]*c[F]*Number.Exp(-c[n]*ProjIsometric(ll{1},ell))
+                in {rho*Number.Sin(theta), c[rho0]-rho*Number.Cos(theta)},
+            inverse=(xy,p,ell) => let
+                c=ProjLCCConstants(p,ell), y=c[rho0]-xy{1}, sign=Number.Sign(c[n]),
+                rho=sign*Number.Sqrt(xy{0}*xy{0}+y*y), theta=Number.Atan2(sign*xy{0},sign*y),
+                t=Number.Power(rho/(ell[a]*p[k]*c[F]),1/c[n])
+                in if rho=0 then {p[lon0]*ProjRadians,sign*ProjPi/2}
+                    else {ProjWrap(theta/c[n]+p[lon0]*ProjRadians),ProjPhi(-Number.Ln(t),ell)}
+        ]
+    ],
+    ProjCreate = (definition as record) as record =>
+        let
+            p=Record.Combine({[lat0=0,lon0=0,k=1,x0=0,y0=0,lat1=0,lat2=0],definition[parameters]}),
+            method=definition[Method], ell=definition[Ellipsoid], unit=definition[UnitToMeter],
+            valid=Record.HasFields(ProjMethods,method) and ell[a]>0 and ell[rf]>=0 and List.AllTrue(List.Transform(Record.FieldValues(p),ProjFinite))
+                and p[k]>0 and Number.Abs(p[lat0])<90 and Number.Abs(p[lat1])<90 and Number.Abs(p[lat2])<90
+                and ProjFinite(unit) and unit>0,
+            checked=if not valid then ProjError("Unsupported projection family or invalid projection parameters/units.") else p,
+            result=Record.Combine({definition,[parameters=checked,IsGeographic=method="longlat",__CRS__=true]})
+        in if method="tmerc" and ell[f]>0.02 then ProjError("The Transverse Mercator series requires flattening <= 1/50.")
+            else if method="merc" and checked[lat0]<>0 then ProjError("Mercator latitude of natural origin must be zero.")
+            else if method="longlat" and (unit<>1 or checked<>[lat0=0,lon0=0,k=1,x0=0,y0=0,lat1=0,lat2=0]) then
+                ProjError("Geographic CRSs must use degree coordinates without projected offsets or scale parameters.")
+            else if method="lcc" then
+            if ProjFinite(ProjLCCConstants(checked,ell)[n]) then result else ProjError("Invalid LCC definition.")
+            else if checked[k]>0 then result else ProjError("Invalid CRS."),
+
+    ProjFromProj4 = (text as text) as record =>
+        let
+            tokens=List.Select(Text.SplitAny(Text.Trim(text)," " & Character.FromNumber(9) & Character.FromNumber(10) & Character.FromNumber(13)),each _<>""),
+            names=List.Transform(tokens,each Text.BeforeDelimiter(Text.TrimStart(_,"+") & "=","=")),
+            values=List.Transform(tokens,each if Text.Contains(_,"=") then Text.AfterDelimiter(_,"=") else "true"),
+            supported={"proj","datum","ellps","a","b","rf","f","R","lat_0","lon_0","lat_1","lat_2","lat_ts","k","k_0","x_0","y_0","units","to_meter","towgs84","nadgrids","no_defs","type","zone","south","axis","pm"},
+            raw=if List.IsEmpty(tokens) or List.AnyTrue(List.Transform(tokens,each not Text.StartsWith(_,"+"))) then ProjError("Expected a +key=value PROJ4 definition.")
+                else if List.Count(List.Distinct(names))<>List.Count(names) then ProjError("Duplicate PROJ4 parameter.")
+                else if not List.IsEmpty(List.Difference(names,supported)) then ProjError("Unsupported PROJ4 parameters: " & Text.Combine(List.Difference(names,supported),", "))
+                else Record.FromList(values,names),
+            get=(key,default)=>Record.FieldOrDefault(raw,key,default),
+            num=(key,default)=>if Record.HasFields(raw,key) then Number.FromText(Record.Field(raw,key),"en-US") else default,
+            datumName=get("datum",null),
+            datum=if datumName=null then null else if Record.HasFields(ProjDatums,datumName) then Record.Field(ProjDatums,datumName)
+                else ProjError("Unsupported named datum. Supply explicit ellipsoid and +towgs84 parameters."),
+            namedEll=get("ellps",null),
+            named=if namedEll=null then (if datum=null then ProjEllipsoids[WGS84] else datum[ellipsoid])
+                else if Record.HasFields(ProjEllipsoids,namedEll) then Record.Field(ProjEllipsoids,namedEll)
+                else ProjError("Unknown ellipsoid. Supply +a and +rf (or +b)."),
+            a=num("a",named[a]),
+            rf=if Record.HasFields(raw,"b") then (if num("b",a)=a then 0 else a/(a-num("b",a)))
+                else if Record.HasFields(raw,"f") then (if num("f",0)=0 then 0 else 1/num("f",0)) else num("rf",named[rf]),
+            ell=if Record.HasFields(raw,"R") then ProjEllipsoid(num("R",0),0) else ProjEllipsoid(a,rf),
+            inputMethod=get("proj",null), method=if List.Contains({"latlong","lonlat"},inputMethod) then "longlat"
+                else if inputMethod="utm" then "tmerc" else if inputMethod="webmerc" then "merc" else inputMethod,
+            projectionEll=if inputMethod="webmerc" then ProjEllipsoid(ell[a],0) else ell,
+            zone=num("zone",0),
+            params0=[lat0=num("lat_0",0),lon0=num("lon_0",0),k=num("k_0",num("k",1)),x0=num("x_0",0),y0=num("y_0",0),lat1=num("lat_1",0),lat2=num("lat_2",num("lat_1",0))],
+            params=if inputMethod="utm" then
+                if zone<1 or zone>60 or Number.RoundDown(zone)<>zone then ProjError("UTM zone must be an integer from 1 to 60.")
+                else Record.Combine({params0,[lat0=0,lon0=zone*6-183,k=0.9996,x0=500000,y0=if Record.HasFields(raw,"south") then 10000000 else 0]})
+                else if Record.HasFields(raw,"lat_ts") then
+                    if method<>"merc" or Number.Abs(num("lat_ts",0))>=90 then ProjError("+lat_ts is supported for Mercator, between -90 and 90 degrees.")
+                    else Record.Combine({params0,[k=Number.Cos(num("lat_ts",0)*ProjRadians)/Number.Sqrt(1-projectionEll[e2]*Number.Power(Number.Sin(num("lat_ts",0)*ProjRadians),2))]})
+                else params0,
+            unitName=get("units","m"), unit=if Record.HasFields(raw,"to_meter") then num("to_meter",1)
+                else if Record.HasFields(ProjUnits,unitName) then Record.Field(ProjUnits,unitName) else ProjError("Unsupported linear unit."),
+            helmert=if Record.HasFields(raw,"towgs84") then List.Transform(Text.Split(raw[towgs84],","),each Number.FromText(_,"en-US"))
+                else if datum=null then null else datum[toWGS84],
+            checkedHelmert=if helmert=null then null else if not List.Contains({3,7},List.Count(helmert)) or not List.AllTrue(List.Transform(helmert,ProjFinite)) then
+                ProjError("+towgs84 requires three or seven finite numbers.") else helmert,
+            datumEll=if datum=null then ell else datum[ellipsoid],
+            key=if datumName<>null then datumName else "unspecified:" & Number.ToText(ell[a],"G17","en-US") & ":" & Number.ToText(ell[rf],"G17","en-US"),
+            grids=get("nadgrids",null),
+            result=ProjCreate([Name=if datumName=null then inputMethod else datumName & " / " & inputMethod,
+                Method=method, Ellipsoid=projectionEll, DatumEllipsoid=datumEll, DatumKey=key,
+                ToWGS84=checkedHelmert, ApproximateDatum=if Record.HasFields(raw,"towgs84") then true else if datum=null then false else datum[approximate],
+                Grid=grids, UnitToMeter=unit, parameters=params]),
+            axis=get("axis","enu"), pm=get("pm","0"),
+            unsupportedParallels=method<>"lcc" and (Record.HasFields(raw,"lat_1") or Record.HasFields(raw,"lat_2")),
+            unsupportedZone=inputMethod<>"utm" and (Record.HasFields(raw,"zone") or Record.HasFields(raw,"south"))
+        in if axis<>"enu" or pm<>"0" then ProjError("Only GIS east/north axis order and the Greenwich prime meridian are supported.")
+            else if get("type","crs")<>"crs" then ProjError("A CRS definition is required, not a PROJ operation pipeline.")
+            else if unsupportedParallels or unsupportedZone then ProjError("Projection parameters do not belong to the selected family.")
+            else if Record.HasFields(raw,"south") and raw[south]<>"true" then ProjError("+south is a flag; do not supply a value.")
+            else result,
+
+    ProjEPSG = [
+        #"EPSG:4326"=Record.Combine({ProjFromProj4("+proj=longlat +datum=WGS84"),[Name="WGS 84",Code="EPSG:4326"]}),
+        #"EPSG:3857"=Record.Combine({ProjFromProj4("+proj=webmerc +datum=WGS84 +units=m"),[Name="WGS 84 / Pseudo-Mercator",Code="EPSG:3857"]}),
+        #"EPSG:27700"=Record.Combine({ProjFromProj4("+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +datum=OSGB36 +units=m"),[Name="OSGB36 / British National Grid",Code="EPSG:27700"]})
+    ],
+    ProjResolve = (crs as any) as record =>
+        if Value.Is(crs,type text) then
+            if Record.HasFields(ProjEPSG,crs) then Record.Field(ProjEPSG,crs)
+            else if Text.StartsWith(Text.Trim(crs),"+") then ProjFromProj4(crs)
+            else if Text.StartsWith(Text.Trim(crs),"{") then ProjFromJSON(crs)
+            else ProjError("Unknown EPSG identifier. Supply a supported PROJ4 or PROJJSON definition.")
+        else if Value.Is(crs,type record) and Record.FieldOrDefault(crs,"__CRS__",false) then crs
+        else ProjError("Expected a CRS from mgis[proj], or an EPSG/PROJ4/PROJJSON string."),
+
+    ProjJSONUnit = (unit as any, angular as logical) as number =>
+        if Value.Is(unit,type record) then unit[conversion_factor]
+        else if angular and unit="degree" then ProjRadians
+        else if angular and unit="radian" then 1
+        else if not angular and List.Contains({"metre","meter"},unit) then 1
+        else if not angular and unit="foot" then 0.3048
+        else if not angular and unit="US survey foot" then 1200/3937
+        else if unit="unity" then 1 else ProjError("Unsupported PROJJSON unit."),
+    ProjFromJSON = (json as any) as record =>
+        let
+            obj=if Value.Is(json,type text) then Json.Document(json) else json,
+            geographic=obj[type]="GeographicCRS", base=if geographic then obj else obj[base_crs],
+            datum=if Record.HasFields(base,"datum") then base[datum] else base[datum_ensemble],
+            ell0=datum[ellipsoid], a=ell0[semi_major_axis],
+            rf=if Record.HasFields(ell0,"inverse_flattening") then ell0[inverse_flattening]
+                else if ell0[semi_minor_axis]=a then 0 else a/(a-ell0[semi_minor_axis]),
+            ell=ProjEllipsoid(a,rf),
+            id=Record.FieldOrDefault(datum,"id",null),
+            name=datum[name],
+            key=if List.Contains({"World Geodetic System 1984","World Geodetic System 1984 ensemble","WGS 84"},name) or (id<>null and id[authority]="EPSG" and List.Contains({6326,"6326"},id[code])) then "WGS84"
+                else if name="Ordnance Survey of Great Britain 1936" then "OSGB36"
+                else if List.Contains({"North American Datum 1983","NAD83"},name) then "NAD83" else "json:" & name,
+            known=if Record.HasFields(ProjDatums,key) then Record.Field(ProjDatums,key) else null,
+            conversion=if geographic then null else obj[conversion],
+            methodCode=if geographic then "longlat" else Text.From(Record.FieldOrDefault(Record.FieldOrDefault(conversion[method],"id",[]),"code","")),
+            methodMap=[#"9807"="tmerc",#"1024"="webmerc",#"9804"="merc",#"9805"="merc",#"9801"="lcc",#"9802"="lcc"],
+            method=if geographic then "longlat" else if Record.HasFields(methodMap,methodCode) then Record.Field(methodMap,methodCode)
+                else ProjError("Unsupported PROJJSON conversion method. Its EPSG method identifier is required."),
+            parameterMap=[#"8801"="lat0",#"8802"="lon0",#"8805"="k",#"8806"="x0",#"8807"="y0",
+                #"8821"="lat0",#"8822"="lon0",#"8823"="lat1",#"8824"="lat2",#"8826"="x0",#"8827"="y0"],
+            parameters=if geographic then {} else conversion[parameters],
+            pairs=List.Transform(parameters,(p)=>let
+                code=Text.From(p[id][code]), field=if Record.HasFields(parameterMap,code) then Record.Field(parameterMap,code)
+                    else ProjError("Unsupported PROJJSON conversion parameter: " & code),
+                angular=List.Contains({"lat0","lon0","lat1","lat2"},field),
+                value=p[value]*ProjJSONUnit(p[unit],angular)/(if angular then ProjRadians else 1)
+                in [field=field,value=value]),
+            params=Record.FromList(List.Transform(pairs,each [value]),List.Transform(pairs,each [field])),
+            adjusted=if methodCode="9801" then Record.Combine({params,[lat1=params[lat0],lat2=params[lat0]]})
+                else if methodCode="9805" then Record.Combine({params,[k=Number.Cos(params[lat1]*ProjRadians)/Number.Sqrt(1-ell[e2]*Number.Power(Number.Sin(params[lat1]*ProjRadians),2))]}) else params,
+            axes=obj[coordinate_system][axis],
+            axisUnits=List.Transform(axes,each ProjJSONUnit(_[unit],geographic)),
+            prime=Record.FieldOrDefault(base,"prime_meridian",[longitude=0]),
+            result=ProjCreate([Name=obj[name],Method=if method="webmerc" then "merc" else method,
+                Ellipsoid=if method="webmerc" then ProjEllipsoid(a,0) else ell,
+                DatumEllipsoid=ell,DatumKey=key,ToWGS84=if known=null then null else known[toWGS84],
+                ApproximateDatum=if known=null then false else known[approximate],Grid=null,
+                UnitToMeter=if geographic then 1 else axisUnits{0},parameters=adjusted])
+        in if not List.Contains({"GeographicCRS","ProjectedCRS"},obj[type]) then ProjError("Only 2D GeographicCRS and ProjectedCRS PROJJSON definitions are supported.")
+            else if List.Count(axes)<>2 or not List.Contains({"ellipsoidal","Cartesian"},obj[coordinate_system][subtype]) then ProjError("Expected a two-dimensional coordinate system.")
+            else if not List.ContainsAll(List.Transform(axes,each [direction]),{"east","north"}) then ProjError("Only east/north axes are supported (coordinates are supplied in GIS XY order).")
+            else if axisUnits{0}<>axisUnits{1} or (geographic and axisUnits{0}<>ProjRadians) then ProjError("Geographic input must use degrees; projected axes must use the same linear unit.")
+            else if prime[longitude]<>0 then ProjError("Only the Greenwich prime meridian is supported.") else result,
+
+    ProjCoordinate = (point as list) as list =>
+        if not List.Contains({2,3},List.Count(point)) or not List.AllTrue(List.Transform(point,ProjFinite)) then
+            ProjError("Coordinates must contain two or three finite numbers in XY order.") else point,
+    ProjInverse = (point as list, crs as record) as list =>
+        let
+            checked=ProjCoordinate(point), p=crs[parameters],
+            xy=if crs[IsGeographic] then {checked{0}*ProjRadians,checked{1}*ProjRadians}
+                else {checked{0}*crs[UnitToMeter]-p[x0],checked{1}*crs[UnitToMeter]-p[y0]},
+            ll=Record.Field(ProjMethods,crs[Method])[inverse](xy,p,crs[Ellipsoid]),
+            h=if List.Count(checked)=3 then checked{2} else 0
+        in if not List.AllTrue(List.Transform(ll,ProjFinite)) or Number.Abs(ll{1})>ProjPi/2 then ProjError("Invalid inverse-projected longitude/latitude.")
+            else if crs[IsGeographic] and (Number.Abs(checked{0})>180 or Number.Abs(checked{1})>90) then ProjError("Longitude/latitude must be within [-180,180] and [-90,90].")
+            else {ll{0},ll{1},h},
+    ProjForward = (ll as list, crs as record) as list =>
+        let p=crs[parameters], xy=Record.Field(ProjMethods,crs[Method])[forward](ll,p,crs[Ellipsoid]) in
+            if not crs[IsGeographic] and Number.Abs(ll{1})>=ProjPi/2 then ProjError("Projected pole coordinates are not supported by this implementation.")
+            else if not List.AllTrue(List.Transform(xy,ProjFinite)) then ProjError("Coordinate is outside the projection domain.")
+            else if crs[IsGeographic] then {xy{0}/ProjRadians,xy{1}/ProjRadians,ll{2}}
+            else {(xy{0}+p[x0])/crs[UnitToMeter],(xy{1}+p[y0])/crs[UnitToMeter],ll{2}},
+
+    ProjGeocentric = (ll as list, ell as record) as list =>
+        let n=ell[a]/Number.Sqrt(1-ell[e2]*Number.Power(Number.Sin(ll{1}),2)), r=(n+ll{2})*Number.Cos(ll{1})
+        in {r*Number.Cos(ll{0}),r*Number.Sin(ll{0}),(n*(1-ell[e2])+ll{2})*Number.Sin(ll{1})},
+    ProjGeodetic = (xyz as list, ell as record) as list =>
+        let
+            r=Number.Sqrt(xyz{0}*xyz{0}+xyz{1}*xyz{1}),
+            phi=if r<1e-10 then Number.Sign(xyz{2})*ProjPi/2 else
+                ProjSolve(Number.Atan2(xyz{2},r*(1-ell[e2])),(lat)=>
+                    Number.Atan2(xyz{2}+ell[e2]*ell[a]/Number.Sqrt(1-ell[e2]*Number.Power(Number.Sin(lat),2))*Number.Sin(lat),r),1e-13,30),
+            n=ell[a]/Number.Sqrt(1-ell[e2]*Number.Power(Number.Sin(phi),2)),
+            h=if r<1e-10 then Number.Abs(xyz{2})-ell[b] else r/Number.Cos(phi)-n
+        in {Number.Atan2(xyz{1},xyz{0}),phi,h},
+    ProjHelmert = (xyz as list, values as list, inverse as logical) as list =>
+        let
+            v=values & List.Repeat({0},7-List.Count(values)), rx=v{3}*ProjRadians/3600, ry=v{4}*ProjRadians/3600, rz=v{5}*ProjRadians/3600, s=1+v{6}*1e-6,
+            x=xyz{0},y=xyz{1},z=xyz{2},
+            // Position-vector convention; solve the linear map exactly for inverse.
+            tx=(x-v{0})/s,ty=(y-v{1})/s,tz=(z-v{2})/s, det=1+rx*rx+ry*ry+rz*rz
+        in if inverse then {
+            ((1+rx*rx)*tx+(rz+rx*ry)*ty+(-ry+rx*rz)*tz)/det,
+            ((-rz+rx*ry)*tx+(1+ry*ry)*ty+(rx+ry*rz)*tz)/det,
+            ((ry+rx*rz)*tx+(-rx+ry*rz)*ty+(1+rz*rz)*tz)/det}
+            else {v{0}+s*(x-rz*y+ry*z),v{1}+s*(rz*x+y-rx*z),v{2}+s*(-ry*x+rx*y+z)},
+    ProjDatumLeg = (ll as list, crs as record, inverse as logical, options as record) as list =>
+        let
+            callback=Record.FieldOrDefault(crs,if inverse then "FromWGS84" else "IntoWGS84",null),
+            operation=crs[ToWGS84], grid=crs[Grid],
+            inputEll=if inverse then ProjEllipsoids[WGS84] else crs[DatumEllipsoid],
+            outputEll=if inverse then crs[DatumEllipsoid] else ProjEllipsoids[WGS84],
+            allow=Record.FieldOrDefault(options,"allowApproximateDatum",false)
+        in if callback<>null then let result=callback(ll) in
+                if List.Count(ProjCoordinate(result))<>3 or Number.Abs(result{1})>ProjPi/2 then
+                    ProjError("A datum callback must return three finite coordinates with latitude in radians.") else result
+            else if grid<>null and grid<>"null" then ProjError("This CRS requires a datum grid: " & grid & ". Supply a pure-M datum transform with proj[withDatumTransform]; grid files are not decoded automatically.")
+            else if grid="null" then ll
+            else if crs[DatumKey]="WGS84" and operation<>null and List.AllTrue(List.Transform(operation,each _=0)) then ll
+            else if operation=null then ProjError("No transformation to WGS84 is defined for datum " & crs[DatumKey] & ".")
+            else if crs[ApproximateDatum] and not allow then ProjError("This datum transformation is approximate. Set allowApproximateDatum=true explicitly to use its Helmert parameters.")
+            else ProjGeodetic(ProjHelmert(ProjGeocentric(ll,inputEll),operation,inverse),outputEll),
+    ProjTransform = (point as list, source as any, target as any, optional options as nullable record) as list =>
+        let
+            s=ProjResolve(source),t=ProjResolve(target), opts=options ?? [],
+            ll=ProjInverse(point,s),
+            sameDatum=s[DatumKey]=t[DatumKey] and s[DatumEllipsoid]=t[DatumEllipsoid] and s[ToWGS84]=t[ToWGS84] and s[Grid]=t[Grid]
+                and not Record.HasFields(s,"IntoWGS84") and not Record.HasFields(t,"FromWGS84"),
+            shifted=if sameDatum then ll else ProjDatumLeg(ProjDatumLeg(ll,s,false,opts),t,true,opts),
+            result=ProjForward(shifted,t)
+        in List.FirstN(result,List.Count(point)),
+    ProjWithDatumTransform = (crs as any, intoWGS84 as function, fromWGS84 as function) as record =>
+        Record.Combine({ProjResolve(crs),[IntoWGS84=intoWGS84,FromWGS84=fromWGS84]}),
+
+    // Vincenty's inverse ellipsoidal solution (Survey Review, 1975).
+    // A convergence failure is an error, never an unlabelled spherical fallback.
+    // Heights are excluded: this is surface distance, not a 3D chord distance.
+    ProjGeodesic = (first as list, second as list, ell as record) as number =>
+        let
+            L=ProjWrap(second{0}-first{0}),
+            u1=Number.Atan((1-ell[f])*Number.Tan(first{1})),u2=Number.Atan((1-ell[f])*Number.Tan(second{1})),
+            s1=Number.Sin(u1),c1=Number.Cos(u1),s2=Number.Sin(u2),c2=Number.Cos(u2),
+            terms=(lambda) => let
+                sl=Number.Sin(lambda),cl=Number.Cos(lambda),
+                sinSigma=Number.Sqrt(Number.Power(c2*sl,2)+Number.Power(c1*s2-s1*c2*cl,2)),
+                cosSigma=s1*s2+c1*c2*cl, sigma=Number.Atan2(sinSigma,cosSigma),
+                sinAlpha=if sinSigma<1e-15 then 0 else c1*c2*sl/sinSigma,
+                cos2Alpha=1-sinAlpha*sinAlpha,
+                cos2SigmaM=if cos2Alpha<1e-15 then 0 else cosSigma-2*s1*s2/cos2Alpha,
+                C=ell[f]/16*cos2Alpha*(4+ell[f]*(4-3*cos2Alpha)),
+                next=L+(1-C)*ell[f]*sinAlpha*(sigma+C*sinSigma*(cos2SigmaM+C*cosSigma*(-1+2*cos2SigmaM*cos2SigmaM)))
+                in [next=next,sinSigma=sinSigma,cosSigma=cosSigma,sigma=sigma,cos2Alpha=cos2Alpha,cos2SigmaM=cos2SigmaM],
+            coincident=Number.Abs(first{1}-second{1})<1e-15 and
+                (Number.Abs(L)<1e-15 or Number.Abs(Number.Cos(first{1}))<1e-15),
+            solved=try ProjSolve(L,(lambda)=>terms(lambda)[next],1e-12,200),
+            v=if solved[HasError] then ProjError("Ellipsoidal geodesic did not converge (nearly antipodal points). No approximate distance has been returned.") else terms(solved[Value]),
+            u2sq=v[cos2Alpha]*(ell[a]*ell[a]-ell[b]*ell[b])/(ell[b]*ell[b]),
+            A=1+u2sq/16384*(4096+u2sq*(-768+u2sq*(320-175*u2sq))),
+            B=u2sq/1024*(256+u2sq*(-128+u2sq*(74-47*u2sq))),
+            cm=v[cos2SigmaM], ss=v[sinSigma], cs=v[cosSigma],
+            delta=B*ss*(cm+B/4*(cs*(-1+2*cm*cm)-B/6*cm*(-3+4*ss*ss)*(-3+4*cm*cm))),
+            distance=ell[b]*A*(v[sigma]-delta)
+        in if ell[f]>0.02 then ProjError("The geodesic series requires flattening <= 1/50.")
+            else if coincident then 0 else distance,
+    ProjDistance = (first as list, second as list, crs as any, optional options as nullable record) as number =>
+        let
+            c=ProjResolve(crs),opts=options ?? [],mode=Record.FieldOrDefault(opts,"mode","Geodesic"),
+            analysis=ProjResolve(Record.FieldOrDefault(opts,"analysisCRS",c)),
+            p=ProjTransform(first,c,analysis,opts),q=ProjTransform(second,c,analysis,opts)
+        in if mode="Geodesic" then ProjGeodesic(ProjInverse(first,c),ProjInverse(second,c),c[DatumEllipsoid])
+            else if mode<>"Planar" then ProjError("Distance mode must be Planar or Geodesic.")
+            else if analysis[IsGeographic] then ProjError("Planar distances in metres require a projected analysis CRS.")
+            else Number.Sqrt(Number.Power(p{0}-q{0},2)+Number.Power(p{1}-q{1},2))*analysis[UnitToMeter],
+
+    // Transform vertices recursively, preserving all non-coordinate fields.
+    GeometryReproject = (geometry as record, source as any, target as any, options as record) as record =>
+        if geometry[Kind]="POINT" then let
+            point=ProjTransform({geometry[X],geometry[Y]},source,target,options)
+            in Record.TransformFields(geometry,{{"X",each point{0}},{"Y",each point{1}}})
+        else let
+            field=if geometry[Kind]="LINESTRING" then "Points" else if geometry[Kind]="POLYGON" then "Rings" else "Components"
+            in Record.TransformFields(geometry,{{field,each List.Transform(_,(g)=>@GeometryReproject(g,source,target,options))}}),
+    ShapeReproject = (shape as record, source as any, target as any, optional options as nullable record) as record =>
+        let g=GeometryReproject(shape[Geometry],source,target,options ?? []) in
+            Record.TransformFields(shape,{{"Geometry",each g},{"Envelope",each GeometryGetEnvelope(g)}}),
+
+    // RFC 7946 coordinate arrays use longitude/latitude order. An explicitly
+    // supplied layer CRS can describe non-standard projected GeoJSON input.
+    GeometryFromGeoJSON = (geometry as record) as record =>
+        let
+            point=(xy)=>let checked=ProjCoordinate(xy) in [Kind="POINT",X=checked{0},Y=checked{1}],
+            line=(coordinates)=>if List.Count(coordinates)<2 then ProjError("GeoJSON lines require at least two coordinates.")
+                else [Kind="LINESTRING",Points=List.Transform(coordinates,point)],
+            polygon=(coordinates)=>if List.IsEmpty(coordinates) then ProjError("Empty GeoJSON polygons are not supported.") else
+                [Kind="POLYGON",Rings=List.Transform(coordinates,(ring)=>
+                    if List.Count(ring)<4 or List.FirstN(ring{0},2)<>List.FirstN(List.Last(ring),2) then
+                        ProjError("GeoJSON polygon rings require at least four coordinates and must be closed.") else line(ring))],
+            kind=Text.Upper(geometry[type]),coordinates=Record.FieldOrDefault(geometry,"coordinates",null)
+        in if kind="GEOMETRYCOLLECTION" and List.IsEmpty(geometry[geometries]) then ProjError("Empty GeoJSON geometries are not supported.")
+            else if kind<>"GEOMETRYCOLLECTION" and (coordinates=null or List.IsEmpty(coordinates)) then ProjError("Empty GeoJSON geometries are not supported.")
+            else if kind="POINT" then point(coordinates)
+            else if kind="LINESTRING" then line(coordinates)
+            else if kind="POLYGON" then polygon(coordinates)
+            else if kind="MULTIPOINT" then [Kind=kind,Components=List.Transform(coordinates,point)]
+            else if kind="MULTILINESTRING" then [Kind=kind,Components=List.Transform(coordinates,line)]
+            else if kind="MULTIPOLYGON" then [Kind=kind,Components=List.Transform(coordinates,polygon)]
+            else if kind="GEOMETRYCOLLECTION" then [Kind=kind,Components=List.Transform(geometry[geometries],each @GeometryFromGeoJSON(_))]
+            else ProjError("Unsupported GeoJSON geometry type."),
+    ShapeCreateFromGeoJSON = (json as any) as record =>
+        let
+            obj=if Value.Is(json,type text) then Json.Document(json) else json,
+            g=GeometryFromGeoJSON(if obj[type]="Feature" then obj[geometry] else obj)
+        in [__TShapeIdentifier__=null,Kind=g[Kind],Geometry=g,Envelope=GeometryGetEnvelope(g),__rowid__=null],
     
     //Creates a TShape point from latitude and longitude coordinates
     //@param lat - The latitude coordinate
@@ -521,91 +944,9 @@ let
         ), 
         type function (wkt as text) as TShape
     ),
-    //Creates a TShape from a GeoJSON geometry record
-    //@param geojsonRecord - A GeoJSON geometry or Feature record
-    //@returns - A TShape record representing the geometry
-    //@remark Supports all GeoJSON geometry types including GeometryCollection
-    ShapeCreateFromGeoJSONRecord = Value.ReplaceType(
-        (geojsonRecord as record) as record => (
-            let
-                //Extract geometry from Feature if needed
-                geometry = if Record.HasFields(geojsonRecord, "type") and geojsonRecord[type] = "Feature" then
-                    geojsonRecord[geometry]
-                else
-                    geojsonRecord,
-                
-                //Recursive function to convert GeoJSON geometry to base geometry
-                convertGeometry = (geom as record) as record => (
-                    let
-                        geomType = geom[type],
-                        coords = geom[coordinates]?,
-                        
-                        //Convert coordinate pair to point
-                        coordToPoint = (c as list) as record => [Kind = "POINT", X = c{0}, Y = c{1}],
-                        
-                        result = 
-                            if geomType = "Point" then
-                                coordToPoint(coords)
-                            else if geomType = "LineString" then
-                                [Kind = "LINESTRING", Points = List.Transform(coords, coordToPoint)]
-                            else if geomType = "Polygon" then
-                                [
-                                    Kind = "POLYGON", 
-                                    Rings = List.Transform(coords, (ring) => [Kind = "LINESTRING", Points = List.Transform(ring, coordToPoint)])
-                                ]
-                            else if geomType = "MultiPoint" then
-                                [Kind = "MULTIPOINT", Components = List.Transform(coords, coordToPoint)]
-                            else if geomType = "MultiLineString" then
-                                [
-                                    Kind = "MULTILINESTRING", 
-                                    Components = List.Transform(coords, (line) => [Kind = "LINESTRING", Points = List.Transform(line, coordToPoint)])
-                                ]
-                            else if geomType = "MultiPolygon" then
-                                [
-                                    Kind = "MULTIPOLYGON",
-                                    Components = List.Transform(
-                                        coords,
-                                        (poly) => [
-                                            Kind = "POLYGON",
-                                            Rings = List.Transform(poly, (ring) => [Kind = "LINESTRING", Points = List.Transform(ring, coordToPoint)])
-                                        ]
-                                    )
-                                ]
-                            else if geomType = "GeometryCollection" then
-                                [Kind = "GEOMETRYCOLLECTION", Components = List.Transform(geom[geometries], @convertGeometry)]
-                            else
-                                error "Unsupported GeoJSON geometry type: " & geomType
-                    in
-                        result
-                ),
-                
-                baseGeometry = convertGeometry(geometry),
-                envelope = GeometryGetEnvelope(baseGeometry)
-            in [
-                __TShapeIdentifier__ = null,
-                Kind = baseGeometry[Kind],
-                Geometry = baseGeometry,
-                Envelope = envelope,
-                __rowid__ = null
-            ]
-        ),
-        type function (geojsonRecord as record) as TShape
-    ),
-    
-    //Creates a TShape from a GeoJSON text string
-    //@param geojson - A GeoJSON string (geometry or feature)
-    //@returns - A TShape record representing the geometry
-    ShapeCreateFromGeoJSON = Value.ReplaceType(
-        (geojson as text) as record => (
-            let
-                parsed = Json.Document(geojson),
-                shape = ShapeCreateFromGeoJSONRecord(parsed)
-            in
-                shape
-        ),
-        type function (geojson as text) as TShape
-    ),
-
+    // Retain the record-specific API added on master; both entry points use
+    // the same validated geometry parser.
+    ShapeCreateFromGeoJSONRecord = (geojsonRecord as record) as record => ShapeCreateFromGeoJSON(geojsonRecord),
 
     //Ensures a table has a numeric __rowid__ column unique per row
     //@param tbl - The table to ensure has a __rowid__ column
@@ -646,7 +987,7 @@ let
         table = table,
         geometryColumn = text,
         queryLayer = TQuadTree,
-        TProjection = nullable TProjection //TODO: Make this relevant
+        TProjection = nullable TProjection
     ],
     TQuadTreeQueryOperator = type [
         // Required: per‑candidate callback
@@ -677,6 +1018,30 @@ let
         ),
         type function (b1 as TShapeEnvelope, b2 as TShapeEnvelope) as logical
     ),
+
+    // Cache the bounds of all envelope centres below a node. These remain valid
+    // even when root expansion changes the tree's subdivision envelopes.
+    QuadTreeUpdateNearestEnvelope = (node as record) as record =>
+        let
+            ownCentres = List.Transform(node[shapes], (shape) =>
+                let
+                    e = shape[Envelope],
+                    x = (e[MinX] + e[MaxX]) / 2,
+                    y = (e[MinY] + e[MaxY]) / 2
+                in
+                    [MinX = x, MinY = y, MaxX = x, MaxY = y]
+            ),
+            childBounds = if node[children] = null then {} else
+                List.Transform(node[children], each _[nearestEnvelope]),
+            bounds = List.RemoveNulls(ownCentres & childBounds),
+            envelope = if List.IsEmpty(bounds) then null else [
+                MinX = List.Min(List.Transform(bounds, each [MinX])),
+                MinY = List.Min(List.Transform(bounds, each [MinY])),
+                MaxX = List.Max(List.Transform(bounds, each [MaxX])),
+                MaxY = List.Max(List.Transform(bounds, each [MaxY]))
+            ]
+        in
+            Record.Combine({node, [nearestEnvelope = envelope]}),
     //Subdivides a quadtree node into four children (SW, SE, NE, NW)
     //@param node - The node to subdivide
     //@returns - The subdivided node with four children
@@ -688,13 +1053,13 @@ let
                 b = node[envelope],
                 children = {
                     // SW
-                    [envelope = [MinX = b[MinX], MinY = b[MinY], MaxX = midX, MaxY = midY], capacity = node[capacity], shapes = {}, children = null],
+                    [envelope = [MinX = b[MinX], MinY = b[MinY], MaxX = midX, MaxY = midY], capacity = node[capacity], shapes = {}, children = null, nearestEnvelope = null],
                     // SE
-                    [envelope = [MinX = midX, MinY = b[MinY], MaxX = b[MaxX], MaxY = midY], capacity = node[capacity], shapes = {}, children = null],
+                    [envelope = [MinX = midX, MinY = b[MinY], MaxX = b[MaxX], MaxY = midY], capacity = node[capacity], shapes = {}, children = null, nearestEnvelope = null],
                     // NE
-                    [envelope = [MinX = midX, MinY = midY, MaxX = b[MaxX], MaxY = b[MaxY]], capacity = node[capacity], shapes = {}, children = null],
+                    [envelope = [MinX = midX, MinY = midY, MaxX = b[MaxX], MaxY = b[MaxY]], capacity = node[capacity], shapes = {}, children = null, nearestEnvelope = null],
                     // NW
-                    [envelope = [MinX = b[MinX], MinY = midY, MaxX = midX, MaxY = b[MaxY]], capacity = node[capacity], shapes = {}, children = null]
+                    [envelope = [MinX = b[MinX], MinY = midY, MaxX = midX, MaxY = b[MaxY]], capacity = node[capacity], shapes = {}, children = null, nearestEnvelope = null]
                 }
             in                
                 if Record.HasFields(node, {"children"}) then
@@ -715,6 +1080,7 @@ let
                     shapes = {},
                     capacity = capacity,
                     children = null,
+                    nearestEnvelope = null,
                     envelope = initialEnvelope ?? [
                         MinX = 0,
                         MinY = 0,
@@ -815,7 +1181,7 @@ let
 						qx = if cx < midX then 0 else 1,
 						qy = if cy < midY then 0 else 1,
 						idx = if qx = 0 and qy = 0 then 0 else if qx = 1 and qy = 0 then 1 else if qx = 1 and qy = 1 then 2 else 3,
-						makeChild = (env as record) as record => [envelope = env, capacity = node[capacity], shapes = {}, children = null],
+						makeChild = (env as record) as record => [envelope = env, capacity = node[capacity], shapes = {}, children = null, nearestEnvelope = null],
 						baseChildren = List.Transform(quadrants, each @makeChild(_)),
 						updatedChildren = List.Transform({0..3}, (i as number) as record => if i = idx then Record.TransformFields(node, {"envelope", each quadrants{i}}) else baseChildren{i}),
 						newParent = [
@@ -847,14 +1213,18 @@ let
                     //If the node has no children
                     else if node[children] = null then
                         //If the node has capacity, add the shape to the node
-                        if List.Count(node[shapes]) < node[capacity] then
+                        if List.Count(node[shapes]) < node[capacity]
+                            or List.AllTrue(List.Transform(node[shapes], each _[Envelope] = bShape)) then
                             Record.TransformFields(node, {"shapes", each _ & {shape}})
                         //If the node does not have capacity, subdivide the node and redistribute the shapes
                         else
                             let
                                 subdivided = QuadTreeSubdivideNode(node),
                                 allShapes = node[shapes] & {shape},
-                                reshaped = List.Accumulate(allShapes, subdivided, insertIntoChildrenOrKeep)
+                                // Move existing shapes into children without retaining
+                                // duplicate copies on the subdivided parent.
+                                cleared = Record.TransformFields(subdivided, {"shapes", each {}}),
+                                reshaped = List.Accumulate(allShapes, cleared, insertIntoChildrenOrKeep)
                             in
                                 reshaped
                     //If the node has children
@@ -862,7 +1232,7 @@ let
                         //Insert the shape into the appropriate child
                         insertIntoChildrenOrKeep(node, shape)
             in
-                result
+                QuadTreeUpdateNearestEnvelope(result)
         ),
         type function (node as TQuadTreeNode, shape as TShape, isRoot as logical) as TQuadTreeNode
     ),
@@ -882,6 +1252,38 @@ let
         ),
         type function (quadTree as TQuadTree, shape as TShape) as TQuadTree
     ),
+
+    // Bulk loading avoids a long lazy chain of inserts and repeated root
+    // expansion when building/reprojecting a whole table.
+    QuadTreeBuild = (shapes as list, capacity as number) as record =>
+        let
+            items=List.Buffer(shapes), envelopes=List.Transform(items,each [Envelope]),
+            bounds=if List.IsEmpty(items) then [MinX=0,MinY=0,MaxX=0,MaxY=0] else [
+                MinX=List.Min(List.Transform(envelopes,each [MinX])),MinY=List.Min(List.Transform(envelopes,each [MinY])),
+                MaxX=List.Max(List.Transform(envelopes,each [MaxX])),MaxY=List.Max(List.Transform(envelopes,each [MaxY]))],
+            build=(members as list, envelope as record) as record => let
+                buffered=List.Buffer(members),
+                mx=(envelope[MinX]+envelope[MaxX])/2,my=(envelope[MinY]+envelope[MaxY])/2,
+                leaf=List.Count(buffered)<=capacity or
+                    List.AllTrue(List.Transform(buffered,each [Envelope]=buffered{0}[Envelope])) or
+                    ((mx=envelope[MinX] or mx=envelope[MaxX]) and (my=envelope[MinY] or my=envelope[MaxY])),
+                quadrants={
+                    [MinX=envelope[MinX],MinY=envelope[MinY],MaxX=mx,MaxY=my],
+                    [MinX=mx,MinY=envelope[MinY],MaxX=envelope[MaxX],MaxY=my],
+                    [MinX=mx,MinY=my,MaxX=envelope[MaxX],MaxY=envelope[MaxY]],
+                    [MinX=envelope[MinX],MinY=my,MaxX=mx,MaxY=envelope[MaxY]]},
+                assigned=List.Buffer(List.Transform(buffered,(shape)=>let
+                    indexes=List.Select({0..3},(i)=>QuadTreeBoxesIntersect(shape[Envelope],quadrants{i}))
+                    in [shape=shape,child=if List.Count(indexes)=1 then indexes{0} else -1])),
+                own=if leaf then buffered else List.Transform(List.Select(assigned,each [child]=-1),each [shape]),
+                children=if leaf or List.Count(own)=List.Count(buffered) then null else
+                    List.Buffer(List.Transform({0..3},(i)=>@build(List.Transform(List.Select(assigned,each [child]=i),each [shape]),quadrants{i}))),
+                node=QuadTreeUpdateNearestEnvelope([envelope=envelope,capacity=capacity,shapes=own,children=children]),
+                nearest=node[nearestEnvelope]
+                // Force the four cached scalars while this node is built.
+                in if nearest=null then node else if List.Count(List.Buffer(Record.FieldValues(nearest)))=4 then node else ProjError("Invalid index bounds."),
+            root=build(items,bounds)
+        in [root=root,capacity=capacity],
 
 
 
@@ -1029,6 +1431,8 @@ let
     //@remark Distance is calculated between envelope centers, not actual geometry. Results include a 'dist' column.
     QuadTreeOperatorNearestN = Value.ReplaceType(
         (k as number) as record =>
+            if not ProjFinite(k) or k<0 or Number.RoundDown(k)<>k then
+                ProjError("Nearest-neighbour count must be a finite non-negative integer.") else
             [
                 onCandidate = (candidate as record, query as record) as record =>
                     let
@@ -1052,11 +1456,13 @@ let
                     in
                         bestN,
 
-                continueSearch = (partial as any) as logical => 
-                    // stop when we already collected exactly k = 1 neighbours with dist = 0
-                    if Value.Is(partial, type list) and List.Count(partial) = k then false else true,
+                // Having k candidates does not mean they are the closest k.
+                continueSearch = null,
 
-                additionalColumns = {"dist"}
+                additionalColumns = {"dist"},
+                // Extra traversal metadata; kept out of the record type because
+                // Value.ReplaceType requires the existing operators' exact fields.
+                nearestCount = k
             ],
             type function (k as number) as TQuadTreeQueryOperator
     ),
@@ -1065,6 +1471,38 @@ let
     //@returns TQuadTreeQueryOperator - An operator that returns the nearest shape based on envelope center distance
     //@remark This is a convenience wrapper for QuadTreeOperatorNearestN(1)
     QuadTreeOperatorNearest = QuadTreeOperatorNearestN(1),
+
+    QuadTreeOperatorNearestGeodesicN = (k as number) as record =>
+        Record.Combine({QuadTreeOperatorNearestN(k),[
+            distanceMode="Geodesic",
+            onCandidate=(candidate as record, query as record) as record =>
+                if candidate[Kind]<>"POINT" or query[Kind]<>"POINT" then
+                    ProjError("Geodesic nearest-neighbour queries currently require point geometries.")
+                else Record.FromList(List.Buffer({candidate,ProjDistance(
+                    {candidate[Geometry][X],candidate[Geometry][Y]},
+                    {query[Geometry][X],query[Geometry][Y]},ProjEPSG[#"EPSG:4326"])}),{"shape","dist"})
+        ]}),
+    ProjUnitVector = (longitude as number, latitude as number) as list =>
+        let lon=longitude*ProjRadians,lat=latitude*ProjRadians,c=Number.Cos(lat)
+        in {c*Number.Cos(lon),c*Number.Sin(lon),Number.Sin(lat)},
+    // Cache 3D unit-sphere bounds ONCE per analysis index, not once per query.
+    // These bounds handle poles and the date line without longitude wrapping.
+    QuadTreePrepareGeodesic = (node as record) as record =>
+        let
+            children=if node[children]=null then null else List.Buffer(List.Transform(node[children],each @QuadTreePrepareGeodesic(_))),
+            own=List.Buffer(List.Transform(node[shapes],each
+                if _[Kind]<>"POINT" then ProjError("Geodesic nearest-neighbour queries require point geometries.")
+                else let v=List.Buffer(ProjUnitVector(_[Geometry][X],_[Geometry][Y])) in
+                    if v{0}<=1 then [min=v,max=v] else ProjError("Invalid geodesic index coordinate."))),
+            childBounds=if children=null then {} else List.Buffer(List.RemoveNulls(List.Transform(children,each [geodesicBounds]))),
+            all=List.Buffer(own & childBounds),
+            bounds=if List.IsEmpty(all) then null else [
+                min=List.Buffer(List.Transform({0..2},(i)=>List.Min(List.Transform(all,each [min]{i})))),
+                max=List.Buffer(List.Transform({0..2},(i)=>List.Max(List.Transform(all,each [max]{i}))))
+            ]
+        in if bounds=null then Record.Combine({node,[children=children,geodesicBounds=null]})
+            else if bounds[min]{0}<=bounds[max]{0} then Record.Combine({node,[children=children,geodesicBounds=bounds]})
+            else ProjError("Invalid geodesic index bounds."),
 
     //Normalizes a value to a list, converting null to empty list and single values to single-element lists
     //@param value as (Null | List<Any> | Any) - The value to normalize to a list
@@ -1153,6 +1591,53 @@ let
 
         type function (node as TQuadTreeNode, shape as TShape, operator as TQuadTreeQueryOperator) as any
     ),
+
+    // Branch-and-bound nearest search. Visit the closest child first, carrying
+    // the best k candidates forward so farther subtrees can be skipped entirely.
+    QuadTreeQueryNearest = (node as record, shape as record, operator as record) as list =>
+        let
+            k = operator[nearestCount],
+            e = shape[Envelope],
+            x = (e[MinX] + e[MaxX]) / 2,
+            y = (e[MinY] + e[MaxY]) / 2,
+            geodesic=Record.FieldOrDefault(operator,"distanceMode",null)="Geodesic",
+            vector=ProjUnitVector(x,y),
+            minimumDistance = (current as record) as nullable number =>
+                let
+                    bounds = Record.FieldOrDefault(current, "nearestEnvelope", current[envelope]),
+                    dx = if bounds = null then 0 else List.Max({bounds[MinX] - x, 0, x - bounds[MaxX]}),
+                    dy = if bounds = null then 0 else List.Max({bounds[MinY] - y, 0, y - bounds[MaxY]}),
+                    sphereBounds=Record.FieldOrDefault(current,"geodesicBounds",null),
+                    gaps=if sphereBounds=null then {} else List.Transform({0..2},(i)=>List.Max({sphereBounds[min]{i}-vector{i},0,vector{i}-sphereBounds[max]{i}})),
+                    // For an ellipsoid in geodetic latitude, ds^2=M^2*dphi^2 +
+                    // N^2*cos(phi)^2*dlambda^2. M,N >= b^2/a, so ellipsoidal
+                    // surface distance >= (b^2/a)*unit-sphere angular distance
+                    // >= (b^2/a)*unit-sphere chord distance. The distance to a
+                    // box containing every candidate vector is smaller still.
+                    // Subtract a rounding margin before using it for pruning.
+                    radius=ProjEllipsoids[WGS84][b]*ProjEllipsoids[WGS84][b]/ProjEllipsoids[WGS84][a],
+                    lower=radius*List.Max({0,Number.Sqrt(List.Sum(List.Transform(gaps,each _*_)))-1e-10})
+                in if geodesic then (if sphereBounds=null then null else lower)
+                    else if bounds = null then null else Number.Sqrt(dx * dx + dy * dy)*Record.FieldOrDefault(operator,"distanceScale",1),
+            search = (current as record, best as list, lowerBound as nullable number) as list =>
+                if lowerBound = null then best
+                else if List.Count(best) = k and lowerBound > List.Last(best)[dist] then best
+                else
+                    let
+                        candidates = List.Transform(current[shapes], each operator[onCandidate](_, shape)),
+                        updatedBest = List.Buffer(operator[combine]({best, candidates})),
+                        children = if current[children] = null then {} else current[children],
+                        orderedChildren = List.Sort(
+                            List.Transform(children, each [node = _, lowerBound = minimumDistance(_)]),
+                            each [lowerBound]
+                        )
+                    in
+                        List.Accumulate(orderedChildren, updatedBest, (state, child) =>
+                            @search(child[node], state, child[lowerBound])
+                        )
+        in
+            if k = 0 then {}
+            else search(node, {}, minimumDistance(node)),
     
 	//Queries a quadtree based on a spatial relationship to a supplied shape
 	//@param qt - The quadtree to query
@@ -1162,7 +1647,14 @@ let
 	QuadTreeQuery = Value.ReplaceType(
         (qt as record, shape as record, op as record) as list =>
             let
-                res = QuadTreeNodeQuery(qt[root], shape, op),
+                // Geodesic search uses conservative sphere-chord bounds; the
+                // candidate metric remains the ellipsoidal surface distance.
+                res = if Record.FieldOrDefault(op,"distanceMode",null)="Geodesic" then
+                    QuadTreeQueryNearest(if Record.HasFields(qt[root],"geodesicBounds") then qt[root] else QuadTreePrepareGeodesic(qt[root]),shape,op)
+                else if Record.HasFields(op, "nearestCount") then
+                    QuadTreeQueryNearest(qt[root], shape, op)
+                else
+                    QuadTreeNodeQuery(qt[root], shape, op),
                 listOut = NormalizeList(res)
             in
                 listOut,
@@ -1176,11 +1668,11 @@ let
     QuadTreeNodePrune = Value.ReplaceType(
         (node as record, ids as list) as record => (
             let
-                fromNode = if List.MatchesAll(node[shapes], each List.Contains(ids, Record.Field(_, "__rowid__"))) then node else {},
-                fromChildren = if node[children] <> null then List.Transform(node[children], (c as record) as record => @QuadTreeNodePrune(c, ids)) else {},
-                newNode = Record.TransformFields(node, {"shapes", each fromNode, "children", each fromChildren})
+                fromNode = List.Select(node[shapes], each List.Contains(ids, Record.Field(_, "__rowid__"))),
+                fromChildren = if node[children] <> null then List.Transform(node[children], (c as record) as record => @QuadTreeNodePrune(c, ids)) else null,
+                newNode = Record.TransformFields(node, {{"shapes", each fromNode}, {"children", each fromChildren}})
             in
-                newNode
+                QuadTreeUpdateNearestEnvelope(newNode)
         ),
         type function (node as TQuadTreeNode, ids as list) as TQuadTreeNode
     ),
@@ -1194,7 +1686,7 @@ let
     //@param capacity - The capacity of the quadtree (default: 10)
     //@returns - The created blank layer with an empty table
     LayerCreateBlank = Value.ReplaceType(
-        (geometryColumn as nullable text, capacity as nullable number) as record => (
+        (geometryColumn as nullable text, capacity as nullable number, optional projection as any) as record => (
             let
                 geomCol = geometryColumn ?? "shape",
                 tbl = #table({"__rowid__", geomCol}, {})
@@ -1203,10 +1695,10 @@ let
                 table = tbl,
                 geometryColumn = geomCol,
                 queryLayer = QuadTreeCreate(capacity ?? 10, null),
-                TProjection = null
+                TProjection = if projection=null then null else ProjResolve(projection)
             ]
         ),
-        type function (geometryColumn as nullable text, capacity as nullable number) as TLayer
+        type function (geometryColumn as nullable text, capacity as nullable number, optional projection as any) as TLayer
     ),
 
     //Creates a layer from a table with TShape objects
@@ -1215,14 +1707,12 @@ let
     //@returns - The created layer with the table and spatial index
     //@remark The geometry column must contain TShape objects, not WKT strings. Use LayerCreateFromTableWithWKT for WKT input.
     LayerCreateFromTable = Value.ReplaceType(
-        (tbl as table, geometryColumn as text) as record => (
+        (tbl as table, geometryColumn as text, optional projection as any) as record => (
             let
                 _ = if not Table.HasColumns(tbl, {geometryColumn}) then error "Table does not have the geometry column. Please create the column with the relevant `gisShapeCreateFrom...` functions." else null,
                 _2 = if not Table.MatchesAllRows(tbl, each Record.HasFields(_, {"__TShapeIdentifier__"})) then error "Table geometry column does not contain `TShape`s. Please recreate the column with the relevant `gisShapeCreateFrom...` functions." else null,
                 tblWithId = EnsureRowIdColumn(tbl),
-                qtCapacityRaw = Number.RoundDown(Table.RowCount(tblWithId) / 10),
-                qtCapacity = if qtCapacityRaw < 5 then 5 else qtCapacityRaw,
-                qt = QuadTreeCreate(qtCapacity, null),
+                qtCapacity = List.Max({10, Table.RowCount(tblWithId) / 10}),
                 shapesWithIds = Table.TransformRows(
                     tblWithId,
                     (r as record) as record =>
@@ -1233,7 +1723,7 @@ let
                         in
                             s2
                 ),
-                inserted = List.Accumulate(shapesWithIds, qt, QuadTreeInsert),
+                inserted = QuadTreeBuild(shapesWithIds, qtCapacity),
                 tableWithUpdatedShapes = Table.FromColumns(
                     List.Transform(
                         Table.ColumnNames(tblWithId),
@@ -1246,10 +1736,10 @@ let
                     table = tableWithUpdatedShapes,
                     geometryColumn = geometryColumn,
                     queryLayer = inserted,
-                    TProjection = null
+                    TProjection = if projection=null then null else ProjResolve(projection)
                 ]
         ),
-        type function (tbl as table, geometryColumn as text) as TLayer
+        type function (tbl as table, geometryColumn as text, optional projection as any) as TLayer
     ),
 
     //Creates a layer from a table with a Well-Known Text (WKT) geometry column
@@ -1257,36 +1747,42 @@ let
     //@param wktColumn - The column name that contains WKT text
     //@returns - The created layer with WKT column transformed to TShape objects
     LayerCreateFromTableWithWKT = Value.ReplaceType(
-        (tbl as table, wktColumn as text) as record => (
+        (tbl as table, wktColumn as text, optional projection as any) as record => (
             let
                 _ = if not Table.HasColumns(tbl, {wktColumn}) then error "Table does not have a column named " & wktColumn & "." else null,
                 tblWithShapes = Table.TransformColumns(tbl, {{wktColumn, each ShapeCreateFromWKT(_), type record}}),
-                layer = LayerCreateFromTable(tblWithShapes, wktColumn),
-                TProjection = null
+                layer = LayerCreateFromTable(tblWithShapes, wktColumn, projection)
             in
                 layer
         ),
-        type function (tbl as table, wktColumn as text) as TLayer
+        type function (tbl as table, wktColumn as text, optional projection as any) as TLayer
     ),
 
-    //Creates a layer from a table with a GeoJSON geometry column (text or records)
+    //Creates a point layer from a table with numeric X and Y coordinate columns
     //@param tbl - The table to create the layer from
-    //@param geojsonColumn - The column name that contains GeoJSON text or records
-    //@returns - The created layer with GeoJSON column transformed to TShape objects
-    LayerCreateFromTableWithGeoJSON = Value.ReplaceType(
-        (tbl as table, geojsonColumn as text) as record => (
+    //@param xColumn - The column name that contains X coordinates
+    //@param yColumn - The column name that contains Y coordinates
+    //@returns - The created layer with the original columns and a new shape column
+    LayerCreateFromTableWithXY = Value.ReplaceType(
+        (tbl as table, xColumn as text, yColumn as text, optional projection as any) as record => (
             let
-                _ = if not Table.HasColumns(tbl, {geojsonColumn}) then error "Table does not have a column named " & geojsonColumn & "." else null,
-                tblWithShapes = Table.TransformColumns(
-                    tbl, 
-                    {{geojsonColumn, each if Value.Is(_, type text) then ShapeCreateFromGeoJSON(_) else ShapeCreateFromGeoJSONRecord(_), type record}}
-                ),
-                layer = LayerCreateFromTable(tblWithShapes, geojsonColumn),
-                TProjection = null
+                validatedTable =
+                    if not Table.HasColumns(tbl, {xColumn, yColumn}) then
+                        error "Table must contain the coordinate columns " & xColumn & " and " & yColumn & "."
+                    else if Table.HasColumns(tbl, {"shape"}) then
+                        error "Table already has a column named shape. Rename it before creating a layer from XY coordinates."
+                    else
+                        tbl,
+                tblWithShapes = Table.AddColumn(
+                    validatedTable,
+                    "shape",
+                    each ShapeCreatePointFromLatLng(Record.Field(_, yColumn), Record.Field(_, xColumn)),
+                    type record
+                )
             in
-                layer
+                LayerCreateFromTable(tblWithShapes, "shape", projection)
         ),
-        type function (tbl as table, geojsonColumn as text) as TLayer
+        type function (tbl as table, xColumn as text, yColumn as text, optional projection as any) as TLayer
     ),
 
     //Creates a layer from a GeoJSON file
@@ -1294,7 +1790,7 @@ let
     //@returns - The created layer with properties and shape columns
     //@remark The table will have columns: __rowid__, properties, shape
     LayerCreateFromGeoJSONFile = Value.ReplaceType(
-        (path as text) as record => (
+        (path as text, optional projection as any) as record => (
             let
                 fileContent = File.Contents(path),
                 jsonText = Text.FromBinary(fileContent),
@@ -1305,7 +1801,8 @@ let
                     error "GeoJSON file must contain a FeatureCollection" 
                     else null,
                 
-                features = geojson[features],
+                features = if geojson[type] <> "FeatureCollection" then
+                    error "GeoJSON file must contain a FeatureCollection" else geojson[features],
                 
                 //Convert features to table rows
                 rows = List.Transform(
@@ -1317,14 +1814,14 @@ let
                 ),
                 
                 //Create table from rows
-                tbl = Table.FromRecords(rows),
+                tbl = Table.FromRecords(rows, {"properties", "shape"}),
                 
                 //Create layer
-                layer = LayerCreateFromTable(tbl, "shape")
+                layer = LayerCreateFromTable(tbl, "shape", projection ?? ProjEPSG[#"EPSG:4326"])
             in
                 layer
         ),
-        type function (path as text) as TLayer
+        type function (path as text, optional projection as any) as TLayer
     ),
 
     //**************************************************
@@ -1626,7 +2123,7 @@ let
     //@returns - A layer with the shapefile data loaded
     //@remark Automatically finds .dbf and .prj files with matching base name
     LayerCreateFromShapefile = Value.ReplaceType(
-        (shpPath as text) as record => (
+        (shpPath as text, optional projection as any) as record => (
             let
                 //Try to find corresponding .dbf and .prj files
                 shpPathNormalized = Text.Lower(shpPath),
@@ -1659,13 +2156,13 @@ let
                         emptyTable
                 ),
                 
-                //Load .prj file if it exists (for future use)
-                projection = try (
+                // Preserve CRS WKT without treating unparsed metadata as an analysis CRS.
+                projectionWKT = try (
                     let
                         prjBuffer = File.Contents(prjPath),
                         prjContent = Text.FromBinary(prjBuffer)
                     in
-                        [Name = null, Data = prjContent]
+                        prjContent
                 ) otherwise null,
                 
                 //Add geometry column to table
@@ -1683,14 +2180,14 @@ let
                 ),
                 
                 //Create layer from table
-                layer = LayerCreateFromTable(combinedTable, "shape"),
+                layer = LayerCreateFromTable(combinedTable, "shape", projection),
                 
                 //Add projection info
-                layerWithProjection = Record.TransformFields(layer, {"TProjection", each projection})
+                layerWithProjection = Record.AddField(layer, "projectionWKT", projectionWKT)
             in
                 layerWithProjection
         ),
-        type function (shpPath as text) as TLayer
+        type function (shpPath as text, optional projection as any) as TLayer
     ),
 
     
@@ -1743,33 +2240,6 @@ let
 		type function (layer as TLayer, rows as list) as TLayer
 	),
 
-    //Queries a layer based on a spatial relationship to a supplied shape
-    //@param layer - The layer to query
-    //@param shape - The shape to query against
-    //@param gisOperator - The spatial operator defining the relationship (e.g., Intersect, Contains, Within)
-    //@returns - A new layer containing only the rows that match the spatial query
-    LayerQuerySpatial = Value.ReplaceType(
-        (layer as record, shape as record, gisOperator as record) as record => (
-            let
-                shapes = QuadTreeQuery(layer[queryLayer], shape, gisOperator),
-                ids = List.Transform(List.Select(shapes, each Record.HasFields(_, "__rowid__") and (Record.Field(_, "__rowid__") <> null)), each Record.Field(_, "__rowid__")),
-                idsDistinct = List.Distinct(ids),
-                selected = Table.SelectRows(layer[table], (r as record) as logical => List.Contains(idsDistinct, Record.Field(r, "__rowid__"))),
-                filteredQuadTree = [
-                    root = QuadTreeNodePrune(layer[queryLayer][root], idsDistinct),
-                    capacity = layer[queryLayer][capacity]
-                ]
-            in
-                [
-                    table = selected,
-                    geometryColumn = layer[geometryColumn],
-                    queryLayer = filteredQuadTree,
-                    TProjection = layer[TProjection]
-                ]
-        ),
-        type function (layer as TLayer, shape as TShape, gisOperator as TQuadTreeQueryOperator) as TLayer
-    ),
-
     //Queries a layer based on a row-wise relational operator (attribute-based filtering)
     //@param layer - The layer to query
     //@param operator => Logical - A function that takes a record and returns true/false
@@ -1779,7 +2249,7 @@ let
         (layer as record, operator as function) as record => (
             let
                 selected = Table.SelectRows(layer[table], each operator(_)),
-                selectedIDs = List.Transform(selected, each Record.Field(_, "__rowid__")),
+                selectedIDs = Table.Column(selected, "__rowid__"),
                 filteredQuadTree = [
                     root = QuadTreeNodePrune(layer[queryLayer][root], selectedIDs),
                     capacity = layer[queryLayer][capacity]
@@ -1805,10 +2275,9 @@ let
     //@param joinType - The type of join to perform. If not provided, the default is "Inner".
     //                  Remark: Supported types are "Inner", "Left Outer", "Right Outer", "Full Outer"
     //@return The joined layer, the table of which has 4 columns: __rowid__, layer1, layer2, shape. Where layer1 and layer2 are the row objects from the original layers, and shape is the shape of the row from the original layer.
-    LayerJoinSpatial = Value.ReplaceType(
+    LayerJoinSpatialCore = Value.ReplaceType(
         (layer1 as record, layer2 as record, gisOperator as nullable record, joinType as nullable text) as record => (
             let
-                //TODO: Need to reproject layer 2 to layer 1's projection
                 actualJoinType = joinType ?? "Inner",
                 actualGisOperator = gisOperator ?? [onCandidate = QuadTreeOperatorEnvelopeIntersects],
                 table1 = layer1[table],
@@ -1943,7 +2412,7 @@ let
                                                             r2id = r2[__rowid__],
                                                             shapeData = if List.Count(shapes) > 0 then List.First(List.Select(shapes, each _[shape][__rowid__] = r2id)) else null,
                                                             shapeExtras = if shapeData <> null then Record.RemoveFields(shapeData, {"shape"}) else [],
-                                                            extras = Record.RemoveFields(r2, {"shape", "__rowid__"}),
+                                                            extras = Record.RemoveFields(r2, {geomCol2, "__rowid__"}),
                                                             actualShape = if shapeData <> null then shapeData[shape] else null
                                                         in
                                                             Record.Combine({
@@ -1960,7 +2429,7 @@ let
                                 ),
                             // Unmatched rows from layer2
                             unmatchedRows =
-                                List.Transform(
+                                Table.TransformRows(
                                     Table.SelectRows(
                                         table2,
                                         (r2 as record) as logical =>
@@ -2005,7 +2474,7 @@ let
                                                                 r2id = r2[__rowid__],
                                                                 shapeData = if List.Count(shapes) > 0 then List.First(List.Select(shapes, each _[shape][__rowid__] = r2id)) else null,
                                                                 shapeExtras = Record.RemoveFields(shapeData, {"shape"}),
-                                                                extras = Record.RemoveFields(r2, {"shape", "__rowid__"}),
+                                                                extras = Record.RemoveFields(r2, {geomCol2, "__rowid__"}),
                                                                 actualShape = shapeData[shape]
                                                             in
                                                                 Record.Combine({
@@ -2027,7 +2496,7 @@ let
                                     )
                                 ),
                             unmatchedLayer2 =
-                                List.Transform(
+                                Table.TransformRows(
                                     Table.SelectRows(
                                         table2,
                                         (r2 as record) as logical =>
@@ -2050,7 +2519,8 @@ let
                 normalizedRows = NormalizeRecords(resultRows, actualGisOperator[additionalColumns]),
                 
                 // Create result table with __rowid__ column
-                resultTable0 = Table.FromRecords(normalizedRows),
+                resultColumns = List.Distinct(List.Combine({{"layer1","layer2","shape"},actualGisOperator[additionalColumns] ?? {},List.Combine(List.Transform(normalizedRows,Record.FieldNames))})),
+                resultTable0 = Table.FromRecords(normalizedRows, resultColumns, MissingField.UseNull),
                 resultTable = Table.AddIndexColumn(resultTable0, "__rowid__", 0, 1, Int64.Type),
                 baseColumns = {"__rowid__", "layer1", "layer2", "shape"},
                 allColumns = Table.ColumnNames(resultTable),
@@ -2088,16 +2558,93 @@ let
                 ]
         ),
         type function (layer1 as TLayer, layer2 as TLayer, gisOperator as nullable TQuadTreeQueryOperator, joinType as nullable text) as TLayer
-    )
+    ),
+
+    LayerCreateFromTableWithGeoJSON = (tbl as table, geometryColumn as text, optional projection as any) as record =>
+        if not Table.HasColumns(tbl,{geometryColumn}) then ProjError("GeoJSON geometry column is missing.")
+        else LayerCreateFromTable(Table.TransformColumns(tbl,{{geometryColumn,ShapeCreateFromGeoJSON,type record}}),geometryColumn,projection ?? ProjEPSG[#"EPSG:4326"]),
+
+    LayerReproject = (layer as record, target as any, optional options as nullable record) as record =>
+        let
+            source=layer[TProjection], crs=ProjResolve(target), opts=options ?? [],
+            projected=Table.TransformColumns(layer[table],{{layer[geometryColumn],each ShapeReproject(_,source,crs,opts),type record}}),
+            rebuilt=LayerCreateFromTable(projected,layer[geometryColumn],crs)
+        in if source=null then ProjError("Reprojection requires the layer's source CRS to be declared.")
+            else if not Record.HasFields(source,"IntoWGS84") and not Record.HasFields(crs,"IntoWGS84") and source=crs then layer else rebuilt,
+
+    // Prepare one common CRS and metric before querying. The original source
+    // records remain in layer1/layer2; the result shape/index use the analysis CRS.
+    LayerJoinSpatial = (layer1 as record, layer2 as record, gisOperator as nullable record, joinType as nullable text, optional options as nullable record) as record =>
+        let
+            opts=options ?? [], c1=layer1[TProjection],c2=layer2[TProjection],
+            op0=gisOperator ?? QuadTreeOperatorIntersects,
+            nearest=Record.HasFields(op0,"nearestCount"),
+            requested=Record.FieldOrDefault(opts,"mode",Record.FieldOrDefault(op0,"distanceMode",null)),
+            mode=if requested<>null then requested else if explicitCRS<>null then "Planar"
+                else if nearest and c1<>null and c2<>null and c1[IsGeographic] and c2[IsGeographic] then "Geodesic" else "Planar",
+            explicitCRS=Record.FieldOrDefault(opts,"analysisCRS",null),
+            known=c1<>null and c2<>null,
+            target=if not known then null else if mode="Geodesic" then ProjEPSG[#"EPSG:4326"]
+                else if explicitCRS<>null then ProjResolve(explicitCRS)
+                else if c1[IsGeographic] and not c2[IsGeographic] then c2 else c1,
+            a=if known then LayerReproject(layer1,target,opts) else layer1,
+            b0=if known then LayerReproject(layer2,target,opts) else layer2,
+            b=if mode="Geodesic" then Record.TransformFields(b0,{{"queryLayer",each Record.TransformFields(_,{{"root",QuadTreePrepareGeodesic}})}}) else b0,
+            // Scale the candidate metric AND tree lower bounds together.
+            // Geographic nearest uses sphere bounds and an ellipsoidal metric.
+            op=if mode="Geodesic" then
+                    if Record.FieldOrDefault(op0,"distanceMode",null)="Geodesic" then op0
+                    else QuadTreeOperatorNearestGeodesicN(op0[nearestCount])
+                else if nearest and target<>null then Record.Combine({op0,[
+                    distanceScale=target[UnitToMeter],
+                    onCandidate=(candidate,query)=>let result=op0[onCandidate](candidate,query) in
+                        Record.TransformFields(result,{{"dist",each _*target[UnitToMeter]}})
+                ]}) else op0,
+            joined=LayerJoinSpatialCore(a,b,op,joinType),
+            rows1=Record.FromList(Table.ToRecords(layer1[table]),List.Transform(Table.Column(layer1[table],"__rowid__"),each Text.From(_,"en-US"))),
+            rows2=Record.FromList(Table.ToRecords(layer2[table]),List.Transform(Table.Column(layer2[table],"__rowid__"),each Text.From(_,"en-US"))),
+            restored=Table.TransformColumns(joined[table],{
+                {"layer1",each if _=null then null else Record.Field(rows1,Text.From(_[__rowid__],"en-US"))},
+                {"layer2",each if _=null then null else Record.Field(rows2,Text.From(_[__rowid__],"en-US"))}
+            })
+        in if (c1=null)<>(c2=null) then ProjError("Both layers must declare a CRS when either layer has one.")
+            else if not known and (explicitCRS<>null or requested<>null) then ProjError("An analysis CRS/distance mode requires both source CRSs to be declared.")
+            else if not List.Contains({"Planar","Geodesic"},mode) then ProjError("Distance mode must be Planar or Geodesic.")
+            else if mode="Geodesic" and not nearest then ProjError("Geodesic mode currently supports nearest-neighbour point queries only.")
+            else if mode="Geodesic" and explicitCRS<>null then ProjError("Geodesic mode uses WGS84; analysisCRS is only used in Planar mode.")
+            else if nearest and target<>null and mode="Planar" and target[IsGeographic] then ProjError("Planar nearest-neighbour distances require a projected analysis CRS.")
+            else Record.TransformFields(joined,{{"table",each restored}}),
+
+    LayerQuerySpatial = (layer as record, shape as record, gisOperator as record, optional projection as any, optional options as nullable record) as record =>
+        let
+            queryLayer=LayerCreateFromTable(#table({"shape"},{{shape}}),"shape",projection ?? layer[TProjection]),
+            joined=LayerJoinSpatial(queryLayer,layer,gisOperator,"Inner",options),
+            extras=gisOperator[additionalColumns] ?? {},
+            rows=Table.TransformRows(joined[table],each Record.Combine({_[layer2],Record.SelectFields(_,extras)})),
+            cols=List.Union({Table.ColumnNames(layer[table]),extras}),
+            table=Table.FromRecords(rows,cols,MissingField.UseNull)
+        in LayerCreateFromTable(table,layer[geometryColumn],layer[TProjection])
 in
     [
+        proj = [
+            fromEPSG = ProjEPSG,
+            fromJSON = ProjFromJSON,
+            fromProj4 = ProjFromProj4,
+            transform = ProjTransform,
+            distance = ProjDistance,
+            withDatumTransform = ProjWithDatumTransform,
+            supportedMethods = Record.FieldNames(ProjMethods)
+        ],
         gisShapeCreateFromWKT = ShapeCreateFromWKT,
         gisShapeCreateFromGeoJSON = ShapeCreateFromGeoJSON,
         gisShapeCreateFromGeoJSONRecord = ShapeCreateFromGeoJSONRecord,
+        gisShapeReproject = ShapeReproject,
         gisLayerCreateBlank = LayerCreateBlank,
         gisLayerCreateFromTable = LayerCreateFromTable,
         gisLayerCreateFromTableWithWKT = LayerCreateFromTableWithWKT,
+        gisLayerCreateFromTableWithXY = LayerCreateFromTableWithXY,
         gisLayerCreateFromTableWithGeoJSON = LayerCreateFromTableWithGeoJSON,
+        gisLayerReproject = LayerReproject,
         gisLayerCreateFromGeoJSONFile = LayerCreateFromGeoJSONFile,
         gisLayerCreateFromShapefile = LayerCreateFromShapefile,
         gisLayerQuerySpatial = LayerQuerySpatial,
@@ -2111,7 +2658,9 @@ in
             gisWithin = QuadTreeOperatorWithin,
             gisQueryOperatorType = TQuadTreeQueryOperator, //Provided for custom operators
             gisNearestN = QuadTreeOperatorNearestN,
-            gisNearest = QuadTreeOperatorNearest
+            gisNearest = QuadTreeOperatorNearest,
+            gisNearestGeodesicN = QuadTreeOperatorNearestGeodesicN,
+            gisNearestGeodesic = QuadTreeOperatorNearestGeodesicN(1)
         ],
 		gisLayerInsertRows = LayerInsertRows,
 		gisLayerJoinSpatial = LayerJoinSpatial
