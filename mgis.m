@@ -887,6 +887,143 @@ let
         let g=GeometryReproject(shape[Geometry],source,target,options ?? []) in
             Record.TransformFields(shape,{{"Geometry",each g},{"Envelope",each GeometryGetEnvelope(g)}}),
 
+    // Positive planar buffers, implemented as a union of round segment capsules
+    // and polygon interiors. Noding and polygonization remove internal edges,
+    // preserving concavities, holes and disconnected components.
+    BufferError = (message as text) => error Error.Record("BufferError", message, null),
+    BufferPoint = (x as number, y as number) as record => [Kind="POINT", X=x, Y=y],
+    BufferMap = (geometry as record, transform as function) as record =>
+        if geometry[Kind]="POINT" then transform(geometry)
+        else let field=if geometry[Kind]="LINESTRING" then "Points" else if geometry[Kind]="POLYGON" then "Rings" else "Components"
+            in Record.TransformFields(geometry,{{field,each List.Transform(_,(g)=>@BufferMap(g,transform))}}),
+    BufferRing = (points as list) as record => [Kind="LINESTRING",Points=points & {points{0}}],
+    BufferPolygon = (points as list) as record => [Kind="POLYGON",Rings={BufferRing(points)}],
+    BufferCross = (a as record, b as record) as number => a[X]*b[Y]-a[Y]*b[X],
+    BufferSubtract = (a as record, b as record) as record => BufferPoint(a[X]-b[X],a[Y]-b[Y]),
+    BufferAt = (edge as record, t as number) as record => BufferPoint(edge[a][X]+t*edge[v][X],edge[a][Y]+t*edge[v][Y]),
+    BufferEdges = (points as list) as list =>
+        List.RemoveNulls(List.Transform(List.Skip(List.Positions(points)),(i)=>let
+            a=points{i-1},b=points{i},v=BufferSubtract(b,a),length2=v[X]*v[X]+v[Y]*v[Y]
+            in if length2=0 then null else [a=a,b=b,v=v,length2=length2,
+                MinX=List.Min({a[X],b[X]}),MaxX=List.Max({a[X],b[X]}),
+                MinY=List.Min({a[Y],b[Y]}),MaxY=List.Max({a[Y],b[Y]})])),
+    // Convex hull of the two endpoint circles: Minkowski sum of a segment
+    // and the same regular resolution-gon used for every point buffer.
+    BufferHull = (points as list) as record =>
+        let
+            sorted=List.Buffer(List.Distinct(List.Sort(points,(a,b)=>
+                if a[X]=b[X] then Value.Compare(a[Y],b[Y]) else Value.Compare(a[X],b[X])))),
+            push=(stack,p)=>if List.Count(stack)<2 then stack & {p}
+                else if BufferCross(BufferSubtract(List.Last(stack),stack{List.Count(stack)-2}),BufferSubtract(p,List.Last(stack)))>0 then stack & {p}
+                else @push(List.RemoveLastN(stack,1),p),
+            lower=List.Accumulate(sorted,{},push),upper=List.Accumulate(List.Reverse(sorted),{},push)
+        in BufferPolygon(List.RemoveLastN(lower,1) & List.RemoveLastN(upper,1)),
+    BufferPrimitives = (geometry as record, steps as number) as list =>
+        let
+            circlePoints=(p)=>List.Transform({0..steps-1},(i)=>
+                BufferPoint(p[X]+Number.Cos(2*ProjPi*i/steps),p[Y]+Number.Sin(2*ProjPi*i/steps))),
+            circle=(p)=>BufferPolygon(circlePoints(p)),
+            capsule=(e)=>BufferHull(circlePoints(e[a]) & circlePoints(e[b])),
+            line=(g)=>let edges=BufferEdges(g[Points]) in
+                if List.IsEmpty(g[Points]) then BufferError("Empty geometries cannot be buffered.")
+                else if List.IsEmpty(edges) then {circle(g[Points]{0})} else List.Transform(edges,capsule)
+        in if geometry[Kind]="POINT" then {circle(geometry)}
+            else if geometry[Kind]="LINESTRING" then line(geometry)
+            else if geometry[Kind]="POLYGON" then {geometry} & List.Combine(List.Transform(geometry[Rings],line))
+            else if List.Contains({"MULTIPOINT","MULTILINESTRING","MULTIPOLYGON","GEOMETRYCOLLECTION"},geometry[Kind]) then
+                List.Combine(List.Transform(geometry[Components],each @BufferPrimitives(_,steps)))
+            else BufferError("Unsupported buffer geometry type."),
+
+    BufferUnion = (polygons as list, epsilon as number) as record =>
+        let
+            members=List.Buffer(List.Transform(polygons,(g)=>[geometry=g,envelope=GeometryGetEnvelope(g)])),
+            edges=List.Buffer(List.Combine(List.Transform(List.Positions(members),(i)=>
+                List.Transform(List.Combine(List.Transform(members{i}[geometry][Rings],each BufferEdges(_[Points]))),
+                    (e)=>Record.AddField(e,"owner",i))))),
+            inside=(p)=>List.MatchesAny(members,(m)=>let e=m[envelope] in
+                p[X]>=e[MinX] and p[X]<=e[MaxX] and p[Y]>=e[MinY] and p[Y]<=e[MaxY]
+                    and GeometryPointInPolygon(p,m[geometry])),
+            // Intersection parameters on e, including coincident/collinear edges.
+            cuts=(e,f)=>let
+                w=BufferSubtract(f[a],e[a]),den=BufferCross(e[v],f[v]),
+                parallel=Number.Abs(den)<=1e-13*Number.Sqrt(e[length2]*f[length2]),
+                t=if parallel then 0 else BufferCross(w,f[v])/den,
+                u=if parallel then 0 else BufferCross(w,e[v])/den,
+                project=(p)=>(p[X]-e[a][X])*e[v][X]/e[length2]+(p[Y]-e[a][Y])*e[v][Y]/e[length2]
+                in if not parallel then if t>=0 and t<=1 and u>=0 and u<=1 then {t} else {}
+                    else if Number.Abs(BufferCross(w,e[v]))>epsilon*Number.Sqrt(e[length2]) then {}
+                    else List.Select({project(f[a]),project(f[b])},each _>=0 and _<=1),
+            fragments=List.Buffer(List.Combine(List.Transform(edges,(e)=>let
+                nearby=List.Select(edges,(f)=>f[owner]<>e[owner] and f[MinX]<=e[MaxX]+epsilon
+                    and f[MaxX]>=e[MinX]-epsilon and f[MinY]<=e[MaxY]+epsilon and f[MaxY]>=e[MinY]-epsilon),
+                ts=List.Buffer(List.Sort(List.Distinct({0,1} & List.Combine(List.Transform(nearby,each cuts(e,_)))))),
+                pieces=List.Transform(List.Skip(List.Positions(ts)),(i)=>let
+                    a=BufferAt(e,ts{i-1}),b=BufferAt(e,ts{i}),v=BufferSubtract(b,a),
+                    length=Number.Sqrt(v[X]*v[X]+v[Y]*v[Y]),mid=BufferAt(e,(ts{i-1}+ts{i})/2),
+                    offset=List.Min({epsilon*4,length*1e-4}),
+                    left=inside(BufferPoint(mid[X]-v[Y]*offset/length,mid[Y]+v[X]*offset/length)),
+                    right=inside(BufferPoint(mid[X]+v[Y]*offset/length,mid[Y]-v[X]*offset/length))
+                    in if length<=epsilon or left=right then null
+                        else if left then [a=a,b=b] else [a=b,b=a])
+                in List.RemoveNulls(pieces)))),
+            key=(p)=>Text.From(Number.Round(p[X]/epsilon),"en-US") & ":" & Text.From(Number.Round(p[Y]/epsilon),"en-US"),
+            keyed=List.Buffer(List.Transform(fragments,(e)=>[a=e[a],b=e[b],start=key(e[a]),finish=key(e[b])])),
+            boundary=List.Buffer(Table.ToRecords(Table.Distinct(Table.FromRecords(keyed),{"start","finish"}))),
+            // Interior is always on the left. At touching vertices choose the
+            // first clockwise edge from the reversed incoming direction.
+            walk=(remaining,edge,start,points)=>let
+                rest=List.Buffer(List.RemoveMatchingItems(remaining,{edge})),
+                nexts=List.Select(rest,each [start]=edge[finish]),
+                reverse=Number.Atan2(edge[a][Y]-edge[b][Y],edge[a][X]-edge[b][X]),
+                ranked=List.Sort(List.Transform(nexts,(n)=>[edge=n,turn=
+                    Number.Mod(reverse-Number.Atan2(n[b][Y]-n[a][Y],n[b][X]-n[a][X])+2*ProjPi,2*ProjPi)]),
+                    (a,b)=>Value.Compare(a[turn],b[turn])),
+                path=points & {edge[b]}
+                in if edge[finish]=start then [remaining=rest,points=path]
+                    else if List.IsEmpty(nexts) then BufferError("Buffer boundary could not be closed at numerical precision.")
+                    else @walk(rest,ranked{0}[edge],start,path),
+            rings=List.Buffer(List.Generate(()=>[remaining=boundary,ring=null],each not List.IsEmpty([remaining]) or [ring]<>null,
+                (state)=>if List.IsEmpty(state[remaining]) then [remaining={},ring=null] else let
+                    first=state[remaining]{0},result=walk(state[remaining],first,first[start],{first[a]}),
+                    pts=result[points],area=List.Sum(List.Transform(BufferEdges(pts),each BufferCross(_[a],_[b])))/2
+                    in [remaining=result[remaining],ring=[Kind="LINESTRING",Points=pts,area=area]],each [ring])),
+            valid=List.Select(List.RemoveNulls(rings),each Number.Abs([area])>epsilon*epsilon),
+            shells=List.Select(valid,each [area]>0),holes=List.Select(valid,each [area]<0),
+            holeOwner=(hole)=>let containers=List.Select(shells,(s)=>
+                    GeometryPointInPolygon(hole[Points]{0},[Kind="POLYGON",Rings={s}]))
+                in if List.IsEmpty(containers) then BufferError("Buffer hole has no containing shell.")
+                    else List.Sort(containers,(a,b)=>Value.Compare(a[area],b[area])){0},
+            result=List.Transform(shells,(s)=>[Kind="POLYGON",Rings=List.Transform(
+                {s} & List.Select(holes,each holeOwner(_)=s),each Record.RemoveFields(_,"area"))])
+        in if List.IsEmpty(result) then BufferError("Buffer produced no polygon at numerical precision.")
+            else if List.Count(result)=1 then result{0} else [Kind="MULTIPOLYGON",Components=result],
+
+    BufferResolution = (resolution as nullable number) as number =>
+        let value=resolution ?? 5 in
+            if not ProjFinite(value) or value<3 or value>100 or Number.RoundDown(value)<>value then
+                BufferError("Buffer resolution must be an integer from 3 to 100 segments per circle.") else value,
+    ShapeCreateBuffer = (shape as record, distance as number, optional options as nullable record) as record =>
+        let
+            steps=BufferResolution(Record.FieldOrDefault(options ?? [],"resolution",null)),
+            envelope=shape[Envelope],ox=envelope[MinX],oy=envelope[MinY],
+            // Local coordinates in buffer-radius units reduce cancellation for
+            // projected coordinates with large false eastings/northings.
+            local=BufferMap(shape[Geometry],(p)=>if not ProjFinite(p[X]) or not ProjFinite(p[Y]) then
+                BufferError("Buffer coordinates must be finite.") else BufferPoint((p[X]-ox)/distance,(p[Y]-oy)/distance)),
+            extent=List.Max({(envelope[MaxX]-ox)/distance,(envelope[MaxY]-oy)/distance,1}),
+            epsilon=List.Max({1e-9,extent*1e-12}),
+            primitives=List.Buffer(BufferPrimitives(local,steps)),
+            union=if List.Count(primitives)=1 then primitives{0} else BufferUnion(primitives,epsilon),
+            geometry=BufferMap(union,(p)=>BufferPoint(ox+p[X]*distance,oy+p[Y]*distance)),
+            resultEnvelope=GeometryGetEnvelope(geometry)
+        in if not ProjFinite(distance) or distance<=0 then BufferError("Buffer distance must be a finite positive number.")
+            else if steps<3 then BufferError("Invalid buffer resolution.")
+            else if epsilon>1e-5 then BufferError("Buffer distance is too small relative to the geometry extent.")
+            else if not List.AllTrue(List.Transform(Record.FieldValues(resultEnvelope),ProjFinite)) or
+                resultEnvelope[MaxX]<=resultEnvelope[MinX] or resultEnvelope[MaxY]<=resultEnvelope[MinY] then
+                BufferError("Buffer coordinates overflow or the distance is below coordinate precision.")
+            else Record.TransformFields(shape,{{"Kind",each geometry[Kind]},{"Geometry",each geometry},{"Envelope",each resultEnvelope}}),
+
     // RFC 7946 coordinate arrays use longitude/latitude order. An explicitly
     // supplied layer CRS can describe non-standard projected GeoJSON input.
     GeometryFromGeoJSON = (geometry as record) as record =>
@@ -2579,6 +2716,23 @@ let
         in if source=null then ProjError("Reprojection requires the layer's source CRS to be declared.")
             else if not Record.HasFields(source,"IntoWGS84") and not Record.HasFields(crs,"IntoWGS84") and source=crs then layer else rebuilt,
 
+    LayerCreateBuffer = (layer as record, distance as number, optional unit as nullable text, optional options as nullable record) as record =>
+        let
+            opts=options ?? [],source=layer[TProjection],steps=BufferResolution(Record.FieldOrDefault(opts,"resolution",null)),
+            requested=Record.FieldOrDefault(opts,"analysisCRS",null),
+            target=if requested=null then source else ProjResolve(requested),
+            name=if unit=null then null else Text.Lower(Text.Trim(unit)),
+            factor=if name=null then null else Record.FieldOrDefault(ProjUnits,name,null),
+            radius=if name=null then distance else distance*factor/target[UnitToMeter],
+            working=if requested=null then layer else LayerReproject(layer,target,opts),
+            buffered=Table.TransformColumns(working[table],{{working[geometryColumn],each ShapeCreateBuffer(_,radius,opts),type record}})
+        in if not ProjFinite(distance) or distance<=0 then BufferError("Buffer distance must be a finite positive number.")
+            else if name<>null and factor=null then BufferError("Unsupported buffer unit. Use m, km, cm, mm, ft or us-ft.")
+            else if source=null and (name<>null or requested<>null) then BufferError("A distance unit or analysisCRS requires the layer's CRS to be declared.")
+            else if target<>null and target[IsGeographic] then BufferError("Buffering requires a projected CRS. Supply a projected analysisCRS for geographic layers.")
+            else if steps<3 then BufferError("Invalid buffer resolution.")
+            else LayerCreateFromTable(buffered,working[geometryColumn],target),
+
     // Prepare one common CRS and metric before querying. The original source
     // records remain in layer1/layer2; the result shape/index use the analysis CRS.
     LayerJoinSpatial = (layer1 as record, layer2 as record, gisOperator as nullable record, joinType as nullable text, optional options as nullable record) as record =>
@@ -2646,12 +2800,14 @@ in
         gisShapeCreateFromGeoJSON = ShapeCreateFromGeoJSON,
         gisShapeCreateFromGeoJSONRecord = ShapeCreateFromGeoJSONRecord,
         gisShapeReproject = ShapeReproject,
+        gisShapeCreateBuffer = ShapeCreateBuffer,
         gisLayerCreateBlank = LayerCreateBlank,
         gisLayerCreateFromTable = LayerCreateFromTable,
         gisLayerCreateFromTableWithWKT = LayerCreateFromTableWithWKT,
         gisLayerCreateFromTableWithXY = LayerCreateFromTableWithXY,
         gisLayerCreateFromTableWithGeoJSON = LayerCreateFromTableWithGeoJSON,
         gisLayerReproject = LayerReproject,
+        gisLayerCreateBuffer = LayerCreateBuffer,
         gisLayerCreateFromGeoJSONFile = LayerCreateFromGeoJSONFile,
         gisLayerCreateFromShapefile = LayerCreateFromShapefile,
         gisLayerQuerySpatial = LayerQuerySpatial,

@@ -11,6 +11,7 @@ A powerful GIS (Geographic Information System) library for the PowerQuery M-lang
 - **Well-Known Text (WKT)**: Easy geometry creation from WKT format
 - **Layer Management**: Create and query spatial layers with automatic spatial indexing
 - **Pure M Projections**: Declare source CRSs with EPSG, PROJ4 or PROJJSON; reproject layers and compare distances in metres
+- **Buffers**: Create round polygon buffers around points, polylines and polygons, with distance units and configurable circle resolution
 
 ## Installation
 
@@ -229,6 +230,69 @@ Access operators via `GISLib[gisLayerQueryOperators]`:
 - **`gisNearestGeodesicN(k as number)`** - Returns up to k nearest points by ellipsoidal surface distance in metres
 
 ### Layer Operations
+
+#### `gisLayerCreateBuffer(layer, distance as number, optional unit as nullable text, optional options as nullable record)`
+Creates a positive planar buffer for each row, replacing its geometry with a
+Polygon or MultiPolygon and rebuilding the spatial index. Attributes, row IDs
+and the geometry column name are retained. Supports points, polylines, polygons,
+multipart geometries and geometry collections. Overlapping parts within each
+row are merged; separate rows remain separate. Polygon exteriors expand and
+holes shrink or disappear. Curves use inscribed regular polygons, with round
+ends and joins approximated at the selected resolution.
+
+`distance` must be finite and greater than zero. Zero and negative distances
+(including polygon erosion) are not supported. `unit` accepts `"m"`, `"km"`,
+`"cm"`, `"mm"`, `"ft"` or `"us-ft"`; omitting it uses the analysis CRS's
+coordinate units. Layers with no declared CRS can buffer in coordinate units
+only. Geographic layers require a projected `analysisCRS`; buffers measure
+distance on that grid, including its scale distortion.
+
+`options` accepts:
+
+- `resolution`: integer **3–100 segments per full circle**, default **5**. A point
+  buffer at the default resolution is a pentagon; increase this for smoother,
+  more accurate curves. The largest circle approximation shortfall is
+  `distance * (1 - cos(pi / resolution))`.
+- `analysisCRS`: projected CRS to use before buffering. The result geometry,
+  spatial index and `TProjection` use this CRS. Original attribute columns,
+  including longitude/latitude, retain their supplied values.
+- `allowApproximateDatum`: forwarded to reprojection when changing datums.
+
+```powerquery
+let
+    WGS84 = mgis[proj][fromEPSG][#"EPSG:4326"],
+    UTM31 = mgis[proj][fromProj4]("+proj=utm +zone=31 +datum=WGS84 +units=m"),
+    A = mgis[gisLayerCreateFromTableWithXY](
+        #table({"Name", "Longitude", "Latitude"}, {{"A", 2.2945, 48.8584}}),
+        "Longitude", "Latitude", WGS84
+    ),
+    B = mgis[gisLayerCreateFromTableWithWKT](
+        #table({"Name", "shape"}, {{"B", "POINT(448352.001375365 5411954.90994727)"}}),
+        "shape", UTM31
+    ),
+    B2 = mgis[gisLayerCreateBuffer](B, 10, "m", [resolution = 32]),
+    Joined = mgis[gisLayerJoinSpatial](
+        A, B2, mgis[gisLayerQueryOperators][gisContains], "Left Outer"
+    ),
+    // Geographic inputs can be buffered in a suitable local projected CRS:
+    A2 = mgis[gisLayerCreateBuffer](A, 10, "m", [analysisCRS = UTM31, resolution = 32])
+in
+    Joined[table]
+```
+
+Join operators compare each candidate in the second layer against the query
+from the first: `gisContains` selects buffers containing A. `gisWithin` selects
+candidates inside A. The example coordinates place A approximately 100 metres
+from B, so the 10 metre buffer produces an unmatched left-outer row.
+
+`gisShapeCreateBuffer(shape, distance, optional options)` provides the same
+geometry algorithm in coordinate units, with `[resolution = ...]`. It has no CRS
+or unit conversion; use the layer API for metre distances and reprojection.
+Buffers analyse XY only. Supply valid, nonempty geometries; this operation does
+not repair invalid polygons. Extremely small buffers relative to geometry extent
+are rejected when numerical precision cannot reliably close their boundaries.
+The pure-M union compares segment pairs and can be expensive for large geometries
+or high resolution.
 
 #### `gisLayerQuerySpatial(layer, shape, operator, optional projection, optional options)`
 Queries a layer using a spatial operator. `projection` describes the query shape's
