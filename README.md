@@ -197,8 +197,20 @@ in
 Creates a layer from a column of GeoJSON geometry or Feature objects, supplied as
 JSON strings or parsed records. Supports all seven geometry types. The default
 source CRS is WGS84, as in standard GeoJSON; projected GeoJSON requires an explicit
-CRS. Null and empty geometries are not supported. `gisShapeCreateFromGeoJSON(json)`
+CRS. Null and empty geometries are not supported. `gisShapeCreateFromGeoJSONRecord(record)`
+uses the same parser as `gisShapeCreateFromGeoJSON(json)`, which
 creates an individual shape. Geometry is analysed in 2D.
+
+#### `gisLayerCreateFromGeoJSONFile(path as text, optional projection)`
+Loads a GeoJSON FeatureCollection, preserving each feature's properties. Defaults
+to WGS84 and accepts an explicit CRS for projected input, like the table loader.
+Empty collections produce an empty indexed layer with the same columns.
+
+#### `gisLayerCreateFromShapefile(path as text, optional projection)`
+Loads the `.shp` geometry and matching `.dbf` attributes. Supply the analysis CRS
+as an EPSG identifier, PROJ4/PROJJSON definition, or normalized CRS record. The
+matching `.prj` text is preserved separately as `projectionWKT`; it is not parsed
+into an analysis CRS. Without an explicit projection, `TProjection` remains null.
 
 ### Spatial Query Operators
 
@@ -471,9 +483,15 @@ Run all M test queries with the installed Excel Power Query engine:
 pwsh -NoProfile -File .\tests\TestAll.ps1
 ```
 
-The runner requires Windows and an installed Power Query engine. It automatically uses Windows PowerShell for the .NET Framework engine, fully evaluates each result, and exits with code 1 if any assertion or query fails. Use `-EnginePath` to specify another compatible `Microsoft.MashupEngine.dll` installation, or `-LibraryPath` to test another copy of `mgis.m`.
+The runner requires Windows and an installed Power Query engine. It automatically uses Windows PowerShell for the .NET Framework engine, fully evaluates each result, and exits with code 1 if any assertion or query fails, including a `passed = false` row in `UnitTests.m`. Use `-EnginePath` to specify another compatible `Microsoft.MashupEngine.dll` installation, or `-LibraryPath` to test another copy of `mgis.m`.
 
 Tests 1–4 assert the expected matches and distances while still returning example tables. Tests 5–6 cover XY layer creation and nearest-neighbour regressions, including agreement with exhaustive distances and proof that distant branches are pruned. The separate `Test1Projected.m` through `Test6Projected.m` companions repeat these scenarios with declared CRSs while leaving the originals as null-CRS regressions. They cover mixed EPSG:3857/EPSG:4326 joins, metre distances from feet-based analysis, geographic XY creation, and every nearest-neighbour/pruning regression in both metre and feet units. Tests 7–9 cover independent projection/geodesic references, PROJJSON and PROJ4 validation, mixed-CRS queries and joins, metre units, geometry reprojection, GeoJSON, date-line and polar searches, duplicate points, and explicit proof of geodesic branch pruning.
+
+`UnitTests.m` retains the consolidated suite from master, and `Test10.m` checks
+file-loader integration with projections. The isolated engine host cannot access
+files directly, so the runner supplies `File.Contents` with the committed bytes
+under `tests/data`; the library's actual loaders and binary/JSON parsers run on
+those fixtures. `testRepositoryRoot` supplies a portable fixture path.
 
 The runner supplies `projectionReferences` from the committed M literals in
 `tests/data/projection-references.m`. Their provenance is recorded in

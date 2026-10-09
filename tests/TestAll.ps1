@@ -1,5 +1,5 @@
 <#
-Runs every Test*.m query using the Power Query engine installed with Excel.
+Runs every Test*.m query and the consolidated UnitTests.m suite using the Power Query engine installed with Excel.
 No workbook or Excel process is created. Query results are fully serialized to
 force lazy M values and surface errors in table cells as well as assertions.
 
@@ -60,13 +60,25 @@ try {
     $projectionReferences = if (Test-Path -LiteralPath $referencePath) {
         [IO.File]::ReadAllText($referencePath)
     } else { 'null' }
-    $tests = @(Get-ChildItem -LiteralPath $TestsDirectory -Filter 'Test*.m' -File | Sort-Object Name)
+    # MinimalEngineHost blocks external resources. Supply the committed fixture
+    # bytes to File.Contents so the real M loaders/parsers run without a workbook.
+    # Paths outside tests/data are deliberately absent from this fixture record.
+    $fixtureFields = @(Get-ChildItem -LiteralPath (Join-Path $TestsDirectory 'data') -File -Recurse |
+        Where-Object { $_.Extension -ne '.m' } | Sort-Object FullName | ForEach-Object {
+            $fixtureName = $_.FullName.Replace('\', '/').Replace('"', '""')
+            $fixtureBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($_.FullName))
+            '#"' + $fixtureName + '" = Binary.FromText("' + $fixtureBytes + '", BinaryEncoding.Base64)'
+        })
+    $fixtureSource = '[' + ($fixtureFields -join ', ') + ']'
+    $testRepositoryRoot = (Split-Path $TestsDirectory -Parent).Replace('"', '""')
+    $tests = @(Get-ChildItem -LiteralPath $TestsDirectory -File |
+        Where-Object { $_.Name -like 'Test*.m' -or $_.Name -eq 'UnitTests.m' } | Sort-Object Name)
     if ($tests.Count -eq 0) { throw 'No Test*.m queries found.' }
 
     $failures = 0
     foreach ($test in $tests) {
         $testSource = [IO.File]::ReadAllText($test.FullName)
-        $query = 'let mgis = (' + $source + '), projectionReferences = (' + $projectionReferences + '), result = (' + $testSource + ') in Binary.Length(Json.FromValue(result))'
+        $query = 'let mgis = (' + $source + '), projectionReferences = (' + $projectionReferences + '), testRepositoryRoot = "' + $testRepositoryRoot + '", testFiles = ' + $fixtureSource + ', #"File.Contents" = (path as text, optional options as nullable record) as binary => Record.Field(testFiles, Text.Replace(path, "\", "/")), result = (' + $testSource + '), validated = if Value.Is(result, type table) then if Table.HasColumns(result, "passed") then if Table.MatchesAllRows(result, each [passed] = true) then result else error Error.Record("TestFailure", "Suite returned failed assertions.", Table.SelectRows(result, each [passed] <> true)) else result else result in Binary.Length(Json.FromValue(validated))'
         try {
             $value = [Microsoft.Mashup.Engine1.Language.LanguageLibrary]::Evaluate($query, $library)
             Write-Output ($test.Name + ': PASS (' + $value.ToString() + ' serialized bytes)')
