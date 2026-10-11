@@ -1024,6 +1024,237 @@ let
                 BufferError("Buffer coordinates overflow or the distance is below coordinate precision.")
             else Record.TransformFields(shape,{{"Kind",each geometry[Kind]},{"Geometry",each geometry},{"Envelope",each resultEnvelope}}),
 
+    // Generalized planar Voronoi: construct point/segment bisectors, split at
+    // changes of nearest primitive, then polygonize the surviving boundaries.
+    // Only parabolic arcs are discretized; no raster or vertex-only distance is used.
+    VoronoiError = (message as text) => error Error.Record("VoronoiError",message,null),
+    VoronoiAdd = (a as list,b as list) as list =>
+        List.Buffer(List.Transform({0..List.Max({List.Count(a),List.Count(b)})-1},(i)=>
+            (if i<List.Count(a) then a{i} else 0)+(if i<List.Count(b) then b{i} else 0))),
+    VoronoiScale = (a as list,k as number) as list => List.Buffer(List.Transform(a,each _*k)),
+    VoronoiMultiply = (a as list,b as list) as list =>
+        List.Buffer(List.Transform({0..List.Count(a)+List.Count(b)-2},(i)=>List.Sum(List.Transform(
+            List.Select(List.Positions(a),each i-_>=0 and i-_<List.Count(b)),(j)=>a{j}*b{i-j})))),
+    VoronoiEvaluate = (a as list,t as number) as number =>
+        List.Accumulate(List.Reverse(a),0,(value,c)=>value*t+c),
+    // Derivative roots isolate every real root on a bounded interval, including
+    // even-multiplicity contacts. Bisection avoids a fragile quartic formula.
+    VoronoiRoots = (coefficients as list,lo as number,hi as number) as list =>
+        let
+            magnitude=List.Max(List.Transform(coefficients,Number.Abs)),
+            normalized=if magnitude=0 then {0} else VoronoiScale(coefficients,1/magnitude),
+            nonzero=List.Select(List.Positions(normalized),each Number.Abs(normalized{_})>1e-14),
+            p=List.Buffer(List.FirstN(normalized,if List.IsEmpty(nonzero) then 1 else List.Last(nonzero)+1)),
+            degree=List.Count(p)-1,
+            critical=if degree<=1 then {} else @VoronoiRoots(List.Transform({1..degree},each _*p{_}),lo,hi),
+            knots=List.Buffer(List.Sort(List.Distinct({lo,hi} & critical))),
+            contacts=List.Select(knots,each Number.Abs(VoronoiEvaluate(p,_))<1e-12),
+            crossings=List.RemoveNulls(List.Transform(List.Skip(List.Positions(knots)),(i)=>let
+                a=knots{i-1},b=knots{i},fa=VoronoiEvaluate(p,a),fb=VoronoiEvaluate(p,b),
+                state=List.Accumulate({1..48},List.Buffer({a,b,fa}),(s,j)=>let
+                    mid=(s{0}+s{1})/2,f=VoronoiEvaluate(p,mid)
+                    in if Number.Sign(f)=Number.Sign(s{2}) then List.Buffer({mid,s{1},f}) else List.Buffer({s{0},mid,s{2}}))
+                // A root at a stationary endpoint is already in contacts.
+                // Roundoff there must not invent two nearby crossing roots.
+                in if Number.Abs(fa)>1e-12 and Number.Abs(fb)>1e-12 and fa*fb<0 then (state{0}+state{1})/2 else null))
+        in if magnitude=0 or degree=0 then {} else if degree=1 then let t=-p{0}/p{1}
+            in if t>=lo and t<=hi then {t} else {} else List.Sort(List.Distinct(contacts & crossings)),
+    VoronoiPointAt = (curve as record,t as number) as record =>
+        BufferPoint(VoronoiEvaluate(curve[x],t),VoronoiEvaluate(curve[y],t)),
+    VoronoiLine = (nx as number,ny as number,k as number,bounds as record) as nullable record =>
+        if nx=0 and ny=0 then null else if Number.Abs(nx)>=Number.Abs(ny) then
+            [x={k/nx,-ny/nx},y={0,1},lo=0,hi=bounds[MaxY],curved=false]
+        else [x={0,1},y={k/ny,-nx/ny},lo=0,hi=bounds[MaxX],curved=false],
+    // Canonical endpoint order makes reversed copies evaluate exactly alike,
+    // so coincident sites obey the input-row tie rule without rounding noise.
+    VoronoiSegment = (first as record,last as record) as record => let
+        forward=first[X]<last[X] or (first[X]=last[X] and first[Y]<=last[Y]),
+        a=if forward then first else last,b=if forward then last else first,
+        v=BufferSubtract(b,a),length=Number.Sqrt(v[X]*v[X]+v[Y]*v[Y])
+        in [kind="segment",a=a,b=b,length=length,ux=v[X]/length,uy=v[Y]/length,nx=-v[Y]/length,ny=v[X]/length],
+    VoronoiPrimitives = (g as record) as list =>
+        if g[Kind]="POINT" then {[kind="point",a=g]}
+        else if g[Kind]="LINESTRING" then
+            if List.Count(g[Points])<2 then VoronoiError("Lines require at least two points.") else
+            List.Transform(g[Points],each [kind="point",a=_]) & List.Transform(BufferEdges(g[Points]),each VoronoiSegment(_[a],_[b]))
+        else if g[Kind]="POLYGON" then
+            if List.IsEmpty(g[Rings]) or not List.AllTrue(List.Transform(g[Rings],each
+                List.Count([Points])>=4 and List.First([Points])=List.Last([Points]))) then
+                VoronoiError("Polygon rings must be nonempty and closed, with at least four coordinates.")
+            else List.Combine(List.Transform(g[Rings],each @VoronoiPrimitives(_)))
+        else if List.Contains({"MULTIPOINT","MULTILINESTRING","MULTIPOLYGON","GEOMETRYCOLLECTION"},g[Kind]) then
+            if List.IsEmpty(g[Components]) then VoronoiError("Empty Voronoi sites are not supported.")
+            else List.Combine(List.Transform(g[Components],each @VoronoiPrimitives(_)))
+        else VoronoiError("Unsupported Voronoi geometry type."),
+    VoronoiPolygons = (g as record) as list =>
+        if g[Kind]="POLYGON" then {g} else if Record.HasFields(g,"Components") then
+            List.Combine(List.Transform(g[Components],each @VoronoiPolygons(_))) else {},
+    VoronoiDistance2 = (p as record,primitive as record) as number => let
+        dx=p[X]-primitive[a][X],dy=p[Y]-primitive[a][Y],
+        t=if primitive[kind]="point" then 0 else List.Max({0,List.Min({primitive[length],dx*primitive[ux]+dy*primitive[uy]})}),
+        x=if primitive[kind]="point" then dx else dx-t*primitive[ux],
+        y=if primitive[kind]="point" then dy else dy-t*primitive[uy]
+        in x*x+y*y,
+    VoronoiDistancePolynomial = (curve as record,primitive as record) as list => let
+        x=VoronoiAdd(curve[x],{-primitive[a][X]}),y=VoronoiAdd(curve[y],{-primitive[a][Y]}),
+        n=if primitive[kind]="point" then null else VoronoiAdd(VoronoiScale(x,primitive[nx]),VoronoiScale(y,primitive[ny]))
+        in if n=null then VoronoiAdd(VoronoiMultiply(x,x),VoronoiMultiply(y,y)) else VoronoiMultiply(n,n),
+    VoronoiBisectors = (a as record,b as record,bounds as record) as list =>
+        if a[kind]="point" and b[kind]="point" then List.RemoveNulls({VoronoiLine(
+            2*(b[a][X]-a[a][X]),2*(b[a][Y]-a[a][Y]),
+            b[a][X]*b[a][X]+b[a][Y]*b[a][Y]-a[a][X]*a[a][X]-a[a][Y]*a[a][Y],bounds)})
+        else if a[kind]="segment" and b[kind]="segment" then let
+            ka=a[nx]*a[a][X]+a[ny]*a[a][Y],kb=b[nx]*b[a][X]+b[ny]*b[a][Y]
+            in List.RemoveNulls({VoronoiLine(a[nx]-b[nx],a[ny]-b[ny],ka-kb,bounds),
+                VoronoiLine(a[nx]+b[nx],a[ny]+b[ny],ka+kb,bounds)})
+        else let
+            point=if a[kind]="point" then a else b,seg=if a[kind]="segment" then a else b,
+            dx=point[a][X]-seg[a][X],dy=point[a][Y]-seg[a][Y],
+            u=dx*seg[ux]+dy*seg[uy],height=dx*seg[nx]+dy*seg[ny],v=if Number.Abs(height)<1e-12 then 0 else height,
+            parabola=if v=0 then null else {(u*u+v*v)/(2*v),-u*seg[length]/v,seg[length]*seg[length]/(2*v)},
+            curve=if v=0 then VoronoiLine(seg[ux],seg[uy],u+seg[ux]*seg[a][X]+seg[uy]*seg[a][Y],bounds)
+                else [x=VoronoiAdd({seg[a][X],seg[ux]*seg[length]},VoronoiScale(parabola,seg[nx])),
+                    y=VoronoiAdd({seg[a][Y],seg[uy]*seg[length]},VoronoiScale(parabola,seg[ny])),lo=0,hi=1,curved=true]
+            in List.RemoveNulls({curve}),
+    VoronoiResolution = (value as any) as number => let n=value ?? 10 in
+        if not ProjFinite(n) or n<3 or n>100 or Number.RoundDown(n)<>n then
+            VoronoiError("Voronoi resolution must be an integer from 3 to 100 points per curved edge.") else n,
+    VoronoiCheckChords = (paths as list) as logical => let
+        // Shared boundaries are emitted in both directions. Canonicalizing
+        // their chords keeps the topology check independent of cell ownership.
+        chords=List.Buffer(List.Distinct(List.Combine(List.Transform(paths,(path)=>List.Transform(BufferEdges(path),(e)=>
+            if e[a][X]<e[b][X] or (e[a][X]=e[b][X] and e[a][Y]<=e[b][Y]) then {e[a],e[b]} else {e[b],e[a]}))))),
+        edges=List.Buffer(List.Transform(chords,each BufferEdges(_){0})),
+        crossing=(a,b)=>let den=BufferCross(a[v],b[v]),w=BufferSubtract(b[a],a[a]),
+            parallel=Number.Abs(den)<=1e-12*Number.Sqrt(a[length2]*b[length2]),
+            t=if parallel then 0 else BufferCross(w,b[v])/den,u=if parallel then 0 else BufferCross(w,a[v])/den
+            in not parallel and t>1e-8 and t<1-1e-8 and u>1e-8 and u<1-1e-8,
+        invalid=List.MatchesAny(List.Positions(edges),(i)=>let e=edges{i} in List.MatchesAny(
+            List.Select(List.Skip(edges,i+1),each [MinX]<=e[MaxX] and [MaxX]>=e[MinX] and [MinY]<=e[MaxY] and [MaxY]>=e[MinY]),
+            each crossing(e,_)))
+        in if invalid then VoronoiError("Curve chords cross at this resolution. Increase Voronoi resolution to preserve cell topology.") else true,
+    // Directed edges keep their cell on the left. Clockwise routing from the
+    // reversed incoming edge separates components that touch at a single vertex.
+    VoronoiPolygonize = (input as list) as nullable record => let
+        key=(p)=>Text.From(Number.Round(p[X]*1e9),"en-US") & ":" & Text.From(Number.Round(p[Y]*1e9),"en-US"),
+        snap=(p)=>BufferPoint(Number.Round(p[X]*1e9)/1e9,Number.Round(p[Y]*1e9)/1e9),
+        keyed=List.RemoveNulls(List.Transform(input,(path)=>let
+            pts={snap(List.First(path))} & List.RemoveFirstN(List.RemoveLastN(path,1),1) & {snap(List.Last(path))},
+            start=key(List.First(pts)),finish=key(List.Last(pts))
+            in if start=finish then null else [points=pts,start=start,finish=finish])),
+        edges=List.Buffer(List.Distinct(keyed)),
+        grouped=if List.IsEmpty(edges) then #table({"start","ids"},{}) else Table.Group(
+            Table.FromRecords(List.Transform(List.Positions(edges),each [start=edges{_}[start],id=_])),{"start"},{{"ids",each List.Buffer([id]),type list}}),
+        outgoing=Record.FromList(grouped[ids],grouped[start]),
+        walk=(remaining,id,start,points)=>let
+            e=edges{id},rest=List.Buffer(List.RemoveItems(remaining,{id})),path=List.Buffer(points & List.Skip(e[points],1)),
+            nexts=List.Intersect({Record.FieldOrDefault(outgoing,e[finish],{}),rest}),
+            last=List.Last(e[points]),previous=e[points]{List.Count(e[points])-2},reverse=Number.Atan2(previous[Y]-last[Y],previous[X]-last[X]),
+            ranked=List.Sort(List.Transform(nexts,(j)=>let p=edges{j}[points] in [id=j,turn=
+                Number.Mod(reverse-Number.Atan2(p{1}[Y]-p{0}[Y],p{1}[X]-p{0}[X])+2*ProjPi,2*ProjPi)]),(a,b)=>Value.Compare(a[turn],b[turn]))
+            in if e[finish]=start then [remaining=rest,points=path]
+                else if List.IsEmpty(nexts) then VoronoiError("Voronoi boundary could not be closed at numerical precision.")
+                else @walk(rest,ranked{0}[id],start,path),
+        traced=List.Buffer(List.RemoveNulls(List.Generate(()=>[remaining=List.Positions(edges),ring=null],
+            each not List.IsEmpty([remaining]) or [ring]<>null,(state)=>
+                if List.IsEmpty(state[remaining]) then [remaining={},ring=null] else let
+                    id=state[remaining]{0},result=walk(state[remaining],id,edges{id}[start],{edges{id}[points]{0}}),
+                    area=List.Sum(List.Transform(BufferEdges(result[points]),each BufferCross(_[a],_[b])))/2
+                    in [remaining=result[remaining],ring=[Kind="LINESTRING",Points=result[points],area=area]],each [ring]))),
+        valid=List.Select(traced,each Number.Abs([area])>1e-18),shells=List.Select(valid,each [area]>0),holes=List.Select(valid,each [area]<0),
+        owner=(hole)=>let candidates=List.Select(shells,(s)=>GeometryPointInPolygon(hole[Points]{0},[Kind="POLYGON",Rings={s}]))
+            in if List.IsEmpty(candidates) then VoronoiError("Voronoi hole has no containing shell.")
+                else List.Sort(candidates,(a,b)=>Value.Compare(a[area],b[area])){0},
+        polygons=List.Transform(shells,(s)=>[Kind="POLYGON",Rings=List.Transform({s} & List.Select(holes,each owner(_)=s),each Record.RemoveFields(_,"area"))])
+        in if List.IsEmpty(polygons) then null else if List.Count(polygons)=1 then polygons{0} else [Kind="MULTIPOLYGON",Components=polygons],
+    ShapeCreateVoronoi = (shapes as list,bounds as record,optional options as nullable record) as list => let
+        opts=options ?? [],resolution=VoronoiResolution(Record.FieldOrDefault(opts,"resolution",null)),
+        validBounds=Record.HasFields(bounds,{"MinX","MinY","MaxX","MaxY"}) and
+            List.AllTrue(List.Transform(Record.FieldValues(Record.SelectFields(bounds,{"MinX","MinY","MaxX","MaxY"})),ProjFinite)) and
+            bounds[MaxX]>bounds[MinX] and bounds[MaxY]>bounds[MinY],
+        ox=bounds[MinX],oy=bounds[MinY],
+        scale=List.Max({bounds[MaxX]-ox,bounds[MaxY]-oy} & List.Combine(List.Transform(shapes,(s)=>let e=s[Envelope]
+            in {Number.Abs(e[MinX]-ox),Number.Abs(e[MaxX]-ox),Number.Abs(e[MinY]-oy),Number.Abs(e[MaxY]-oy)}))),
+        localBounds=[MinX=0,MinY=0,MaxX=(bounds[MaxX]-ox)/scale,MaxY=(bounds[MaxY]-oy)/scale],
+        local=List.Buffer(List.Transform(shapes,(s)=>BufferMap(s[Geometry],(p)=>
+            if not ProjFinite(p[X]) or not ProjFinite(p[Y]) then VoronoiError("Voronoi coordinates must be finite.")
+            else BufferPoint((p[X]-ox)/scale,(p[Y]-oy)/scale)))),
+        sites=List.Buffer(List.Transform(local,(g)=>[primitives=List.Buffer(List.Distinct(VoronoiPrimitives(g))),polygons=List.Buffer(VoronoiPolygons(g))])),
+        primitives=List.Buffer(List.Combine(List.Transform(List.Positions(sites),(i)=>List.Transform(sites{i}[primitives],each Record.AddField(_,"site",i))))),
+        segments=List.Buffer(List.Select(primitives,each [kind]="segment")),
+        polygons=List.Buffer(List.Combine(List.Transform(sites,each [polygons]))),
+        polygonEdges=List.Buffer(List.Combine(List.Transform(polygons,(g)=>List.Combine(List.Transform(g[Rings],each BufferEdges([Points])))))),
+        distances=(p)=>List.Transform(sites,(s)=>if List.MatchesAny(s[polygons],each GeometryPointInPolygon(p,_)) then 0
+            else List.Min(List.Transform(s[primitives],each VoronoiDistance2(p,_)))),
+        nearest=(p)=>let ds=List.Buffer(distances(p)),best=List.Min(ds) in List.PositionOf(ds,best),
+        pairs=List.Buffer(List.Combine(List.Transform(List.Positions(primitives),(i)=>List.Transform(
+            List.Select(List.Skip(List.Positions(primitives),i+1),each primitives{_}[site]<>primitives{i}[site]),(j)=>[a=primitives{i},b=primitives{j}])))),
+        roots=(curve,base)=>let
+            all=List.Buffer(List.Transform(primitives,each VoronoiDistancePolynomial(curve,_))),
+            differences=if base=null then List.Transform(pairs,(pair)=>VoronoiAdd(VoronoiDistancePolynomial(curve,pair[a]),
+                VoronoiScale(VoronoiDistancePolynomial(curve,pair[b]),-1))) else
+                List.Transform(all,each VoronoiAdd(VoronoiDistancePolynomial(curve,base),VoronoiScale(_,-1))),
+            projections=List.Combine(List.Transform(segments,(s)=>let u=VoronoiAdd(
+                VoronoiScale(VoronoiAdd(curve[x],{-s[a][X]}),s[ux]),VoronoiScale(VoronoiAdd(curve[y],{-s[a][Y]}),s[uy]))
+                in {u,VoronoiAdd(u,{-s[length]})})),
+            crossings=List.Transform(polygonEdges,(e)=>VoronoiAdd(
+                VoronoiScale(VoronoiAdd(curve[y],{-e[a][Y]}),e[v][X]),VoronoiScale(VoronoiAdd(curve[x],{-e[a][X]}),-e[v][Y]))),
+            clipping={curve[x],VoronoiAdd(curve[x],{-localBounds[MaxX]}),curve[y],VoronoiAdd(curve[y],{-localBounds[MaxY]})}
+            in List.Buffer(List.Sort(List.Distinct({curve[lo],curve[hi]} & List.Combine(List.Transform(
+                all & differences & projections & crossings & clipping,each VoronoiRoots(_,curve[lo],curve[hi])))))),
+        // Classification on both sides also resolves shared/overlapping sites:
+        // exact ties belong to the first input shape, including polygon interiors.
+        pieces=(curve,base,partner,boxEdge)=>let
+            ts=roots(curve,base),
+            intervals=List.RemoveNulls(List.Transform(List.Skip(List.Positions(ts)),(i)=>let
+                lo=ts{i-1},hi=ts{i},t=(lo+hi)/2,p=VoronoiPointAt(curve,t),
+                dx=VoronoiEvaluate(List.Transform(List.Skip(List.Positions(curve[x])),each _*curve[x]{_}),t),
+                dy=VoronoiEvaluate(List.Transform(List.Skip(List.Positions(curve[y])),each _*curve[y]{_}),t),
+                length=Number.Sqrt(dx*dx+dy*dy),delta=List.Min({1e-7,length*(hi-lo)*1e-4}),
+                left=if boxEdge then nearest(p) else nearest(BufferPoint(p[X]-dy*delta/length,p[Y]+dx*delta/length)),
+                right=if boxEdge then -1 else nearest(BufferPoint(p[X]+dy*delta/length,p[Y]-dx*delta/length)),
+                ds=if base=null then null else distances(p),d=if base=null then 0 else VoronoiDistance2(p,base),
+                validPrimitive=(s)=>if s=null or s[kind]="point" then true else let
+                    u=(p[X]-s[a][X])*s[ux]+(p[Y]-s[a][Y])*s[uy]
+                    in u>=-1e-12 and u<=s[length]+1e-12,
+                active=base=null or (validPrimitive(base) and validPrimitive(partner) and
+                    Number.Abs(d-List.Min(ds))<1e-12 and Number.Abs(d-VoronoiDistance2(p,partner))<1e-12)
+                in if hi-lo<1e-12 or length=0 or not active or left=right or
+                    p[X]<-1e-10 or p[X]>localBounds[MaxX]+1e-10 or p[Y]<-1e-10 or p[Y]>localBounds[MaxY]+1e-10 then null
+                    else [lo=lo,hi=hi,left=left,right=right])),
+            // Remove artificial breaks caused by roots of irrelevant competitors.
+            runs=List.Accumulate(intervals,{},(acc,part)=>if List.IsEmpty(acc) then {part} else let last=List.Last(acc)
+                in if last[left]=part[left] and last[right]=part[right] and Number.Abs(last[hi]-part[lo])<1e-12 then
+                    List.RemoveLastN(acc,1) & {[lo=last[lo],hi=part[hi],left=part[left],right=part[right]]} else acc & {part}),
+            result=List.Combine(List.Transform(runs,(r)=>let
+                count=if curve[curved] then resolution else 2,
+                path=List.Buffer(List.Transform({0..count-1},each VoronoiPointAt(curve,r[lo]+(r[hi]-r[lo])*_/(count-1))))
+                in {[site=r[left],path=path]} & (if r[right]<0 then {} else {[site=r[right],path=List.Reverse(path)]})))
+            in result,
+        bisectorEdges=List.Combine(List.Transform(pairs,(pair)=>List.Combine(List.Transform(VoronoiBisectors(pair[a],pair[b],localBounds),
+            each pieces(_,pair[a],pair[b],false))))),
+        lineCurve=(e)=>[x={e[a][X],e[b][X]-e[a][X]},y={e[a][Y],e[b][Y]-e[a][Y]},lo=0,hi=1,curved=false],
+        interiorEdges=List.Combine(List.Transform(polygonEdges,each pieces(lineCurve(_),null,null,false))),
+        rectangle={BufferPoint(0,0),BufferPoint(localBounds[MaxX],0),BufferPoint(localBounds[MaxX],localBounds[MaxY]),BufferPoint(0,localBounds[MaxY]),BufferPoint(0,0)},
+        boxEdges=List.Combine(List.Transform(BufferEdges(rectangle),each pieces(lineCurve(_),null,null,true))),
+        edges=List.Buffer(bisectorEdges & interiorEdges & boxEdges),
+        topology=VoronoiCheckChords(List.Transform(edges,each [path])),
+        result=List.Transform(List.Positions(sites),(i)=>let
+            g=VoronoiPolygonize(List.Transform(List.Select(edges,each [site]=i),each [path])),
+            geometry=if g=null then null else BufferMap(g,(p)=>BufferPoint(
+                if p[X]=Number.Round(localBounds[MaxX]*1e9)/1e9 then bounds[MaxX]
+                    else List.Max({bounds[MinX],List.Min({bounds[MaxX],ox+p[X]*scale})}),
+                if p[Y]=Number.Round(localBounds[MaxY]*1e9)/1e9 then bounds[MaxY]
+                    else List.Max({bounds[MinY],List.Min({bounds[MaxY],oy+p[Y]*scale})})))
+            in if geometry=null then null else [__TShapeIdentifier__=null,Kind=geometry[Kind],Geometry=geometry,Envelope=GeometryGetEnvelope(geometry),__rowid__=shapes{i}[__rowid__]])
+        in if not validBounds then VoronoiError("Voronoi bounds require finite MinX, MinY, MaxX, MaxY with positive width and height.")
+            else if resolution<3 then VoronoiError("Invalid Voronoi resolution.")
+            else if List.IsEmpty(shapes) then {}
+            else if not ProjFinite(scale) or List.Min({localBounds[MaxX],localBounds[MaxY]})<1e-7 then
+                VoronoiError("Voronoi bounds are too small relative to the sites for numerical precision.")
+            else if not topology then VoronoiError("Invalid Voronoi topology.")
+            else result,
+
     // RFC 7946 coordinate arrays use longitude/latitude order. An explicitly
     // supplied layer CRS can describe non-standard projected GeoJSON input.
     GeometryFromGeoJSON = (geometry as record) as record =>
@@ -1886,6 +2117,16 @@ let
         type function (tbl as table, geometryColumn as text, optional projection as any) as TLayer
     ),
 
+    // Tight extent of the current rows, rather than the quadtree's partition
+    // bounds (which can remain expanded after inserts or relational filtering).
+    // Force the four accumulated scalars to avoid a deep lazy chain on large layers.
+    LayerGetExtent = (layer as record) as nullable record => let
+        bounds=List.Accumulate(Table.Column(layer[table],layer[geometryColumn]),null,(state,shape)=>let e=shape[Envelope]
+            in if state=null then List.Buffer({e[MinX],e[MinY],e[MaxX],e[MaxY]}) else List.Buffer({
+                List.Min({state{0},e[MinX]}),List.Min({state{1},e[MinY]}),
+                List.Max({state{2},e[MaxX]}),List.Max({state{3},e[MaxY]})}))
+        in if bounds=null then null else [MinX=bounds{0},MinY=bounds{1},MaxX=bounds{2},MaxY=bounds{3}],
+
     //Creates a layer from a table with a Well-Known Text (WKT) geometry column
     //@param tbl - The table to create the layer from
     //@param wktColumn - The column name that contains WKT text
@@ -2733,6 +2974,21 @@ let
             else if steps<3 then BufferError("Invalid buffer resolution.")
             else LayerCreateFromTable(buffered,working[geometryColumn],target),
 
+    LayerCreateVoronoi = (layer as record,bounds as record,optional options as nullable record) as record => let
+        opts=options ?? [],source=layer[TProjection],requested=Record.FieldOrDefault(opts,"analysisCRS",null),
+        target=if requested=null then source else ProjResolve(requested),
+        working=if requested=null then layer else LayerReproject(layer,target,opts),
+        rows=List.Buffer(Table.ToRecords(working[table])),column=working[geometryColumn],
+        cells=List.Buffer(ShapeCreateVoronoi(List.Transform(rows,each Record.Field(_,column)),bounds,opts)),
+        retained=List.Select(List.Positions(rows),each cells{_}<>null),
+        records=List.Transform(retained,(i)=>Record.TransformFields(rows{i},{{column,each cells{i}}})),
+        tbl=Table.FromRecords(records,Table.ColumnNames(working[table]),MissingField.UseNull),
+        result=LayerCreateFromTable(tbl,column,target)
+        in if source=null and requested<>null then VoronoiError("An analysisCRS requires the layer's source CRS to be declared.")
+            else if target<>null and target[IsGeographic] then VoronoiError("Voronoi requires a projected CRS. Supply a projected analysisCRS for geographic layers.")
+            else if List.Count(cells)<>List.Count(rows) then VoronoiError("Voronoi cells must match the input sites.")
+            else result,
+
     // Prepare one common CRS and metric before querying. The original source
     // records remain in layer1/layer2; the result shape/index use the analysis CRS.
     LayerJoinSpatial = (layer1 as record, layer2 as record, gisOperator as nullable record, joinType as nullable text, optional options as nullable record) as record =>
@@ -2801,13 +3057,16 @@ in
         gisShapeCreateFromGeoJSONRecord = ShapeCreateFromGeoJSONRecord,
         gisShapeReproject = ShapeReproject,
         gisShapeCreateBuffer = ShapeCreateBuffer,
+        gisShapeCreateVoronoi = ShapeCreateVoronoi,
         gisLayerCreateBlank = LayerCreateBlank,
+        gisLayerGetExtent = LayerGetExtent,
         gisLayerCreateFromTable = LayerCreateFromTable,
         gisLayerCreateFromTableWithWKT = LayerCreateFromTableWithWKT,
         gisLayerCreateFromTableWithXY = LayerCreateFromTableWithXY,
         gisLayerCreateFromTableWithGeoJSON = LayerCreateFromTableWithGeoJSON,
         gisLayerReproject = LayerReproject,
         gisLayerCreateBuffer = LayerCreateBuffer,
+        gisLayerCreateVoronoi = LayerCreateVoronoi,
         gisLayerCreateFromGeoJSONFile = LayerCreateFromGeoJSONFile,
         gisLayerCreateFromShapefile = LayerCreateFromShapefile,
         gisLayerQuerySpatial = LayerQuerySpatial,

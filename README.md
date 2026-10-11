@@ -12,6 +12,7 @@ A powerful GIS (Geographic Information System) library for the PowerQuery M-lang
 - **Layer Management**: Create and query spatial layers with automatic spatial indexing
 - **Pure M Projections**: Declare source CRSs with EPSG, PROJ4 or PROJJSON; reproject layers and compare distances in metres
 - **Buffers**: Create round polygon buffers around points, polylines and polygons, with distance units and configurable circle resolution
+- **Generalized Voronoi**: Create nearest-site cells for points, polylines, polygons and multipart geometries, with configurable sampling of curved edges
 
 ## Installation
 
@@ -231,6 +232,26 @@ Access operators via `GISLib[gisLayerQueryOperators]`:
 
 ### Layer Operations
 
+#### `gisLayerGetExtent(layer)`
+Returns the tight bounding box of all geometries in the layer as
+`[MinX=..., MinY=..., MaxX=..., MaxY=...]`, in the layer's current CRS and
+coordinate units. Returns `null` for an empty layer. A point or an axis-aligned
+line can have zero width or height; the function does not add padding.
+Filtered layers use only their retained rows, even if their spatial index still
+has a larger partition envelope.
+
+Use it as the clipping extent for Voronoi cells when both dimensions are positive:
+
+```powerquery
+Cells = mgis[gisLayerCreateVoronoi](
+    Sites, mgis[gisLayerGetExtent](Sites), [resolution=10]
+)
+```
+
+For empty or zero-width/height extents, supply suitable bounds or add padding.
+If using a different Voronoi `analysisCRS`, reproject the layer first and get the
+extent of that reprojected layer so that sites and bounds use the same CRS.
+
 #### `gisLayerCreateBuffer(layer, distance as number, optional unit as nullable text, optional options as nullable record)`
 Creates a positive planar buffer for each row, replacing its geometry with a
 Polygon or MultiPolygon and rebuilding the spatial index. Attributes, row IDs
@@ -293,6 +314,70 @@ not repair invalid polygons. Extremely small buffers relative to geometry extent
 are rejected when numerical precision cannot reliably close their boundaries.
 The pure-M union compares segment pairs and can be expensive for large geometries
 or high resolution.
+
+#### `gisLayerCreateVoronoi(layer, bounds as record, optional options as nullable record)`
+Partitions a finite rectangular area into nearest-site Polygon or MultiPolygon
+cells. Each input row is one site, including all parts of a multipart geometry or
+geometry collection. Distance is the planar Euclidean distance to the actual
+geometry: to points, to the closest position along a polyline, or to the filled
+area of a polygon. Polygon interiors have distance zero; holes remain unfilled.
+It does not substitute centroids or only compare input vertices.
+
+`bounds` is `[MinX=..., MinY=..., MaxX=..., MaxY=...]`, with finite coordinates
+and positive width and height, in the result's analysis CRS. An explicit finite
+extent is required because outer Voronoi cells would otherwise be unbounded.
+
+`options` accepts:
+
+- `resolution`: integer **3–100 points per curved edge**, default **10**.
+  Includes both endpoints; `resolution=10` represents each parabolic edge with
+  10 vertices joined by 9 straight segments. Points are evenly spaced along the
+  generating segment's projection parameter. Straight edges keep their two
+  endpoints. An edge ends when its nearest generating point/segment changes or
+  when it meets the bounds. Increasing resolution improves the curve approximation;
+  it is not a distance tolerance or a sample count for the input geometry.
+- `analysisCRS`: projected CRS to use before constructing cells. Geographic
+  layers require this option. Bounds use this CRS too. Declared projected layers
+  can omit it; undeclared layers work in their supplied coordinate units.
+- `allowApproximateDatum`: forwarded to reprojection when changing datums.
+
+```powerquery
+let
+    Sites = mgis[gisLayerCreateFromTableWithWKT](
+        #table({"Name", "shape"}, {
+            {"Station", "POINT(5 5)"},
+            {"Road", "LINESTRING(-10 0,20 0)"}
+        }), "shape"
+    ),
+    Cells = mgis[gisLayerCreateVoronoi](
+        Sites, [MinX=-5, MinY=-5, MaxX=15, MaxY=15], [resolution=10]
+    )
+in
+    Cells[table]
+```
+
+The result retains the geometry column name, attributes and row IDs, replaces
+site geometries with cell geometries, and rebuilds the spatial index. Exact ties
+belong to the first input row. This also handles overlapping polygon interiors
+and duplicate sites. Rows with no positive-area cell inside the bounds are omitted.
+
+`gisShapeCreateVoronoi(shapes as list, bounds as record, optional options)` provides
+the same geometry algorithm in coordinate units. It returns a list aligned with
+the input shapes, using `null` for sites with no cell. It has no CRS conversion.
+
+This is a pure-M construction using point/segment bisectors. Point-to-segment
+bisectors can be parabolic; this is why generalized Voronoi needs curved-edge
+sampling. See the [Boost.Polygon Voronoi tutorial](https://www.boost.org/latest/libs/polygon/doc/voronoi_basic_tutorial.htm)
+for the underlying geometry. The implementation clips bisectors using polynomial
+root isolation, then joins their surviving boundaries into rings, holes and
+disconnected components. It analyses XY only and expects valid, nonempty input
+geometries. Boundary vertices are snapped at approximately `1e-9` times the
+combined site/bounds extent. Polynomial roots and near-coincident sites also
+have floating-point limits, so this snapping scale is not an accuracy guarantee.
+Bounds smaller than `1e-7` of that extent are rejected. Curve sampling introduces
+additional chord error; low resolutions can distort narrow cells. Detected
+crossing chords raise an error asking for a higher resolution. The all-pairs primitive construction is
+intended for modest datasets and can be expensive for many vertices.
 
 #### `gisLayerQuerySpatial(layer, shape, operator, optional projection, optional options)`
 Queries a layer using a spatial operator. `projection` describes the query shape's
@@ -545,6 +630,30 @@ The library supports four join types:
 
 ## Tests
 
+To export a visual Voronoi example, run:
+
+```powershell
+pwsh -NoProfile -File .\scripts\GenerateVoronoiExample.ps1 -Resolution 10
+```
+
+The script evaluates `scripts/VoronoiExample.m` in the installed Excel Mashup
+engine, using the current `mgis.m`. It writes
+`scripts/output/voronoi-example.geojson` with three source sites (a point,
+polyline and polygon) and their three cells, plus an offline SVG preview.
+Matching `site_id` and color properties associate each cell with its source.
+Construction uses EPSG:3857; the GeoJSON is reprojected to WGS84 in M.
+`-OutputDirectory`, `-LibraryPath` and `-EnginePath` override the defaults.
+
+A second example uses two supplied London polylines. To regenerate it:
+
+```powershell
+pwsh -NoProfile -File .\scripts\GenerateVoronoiExample.ps1 -InputGeoJSONPath .\scripts\data\voronoi-lines.geojson -OutputName voronoi-lines -Resolution 10
+```
+
+This writes `scripts/output/voronoi-lines.geojson` and `voronoi-lines.svg`.
+`-InputGeoJSONPath` accepts a WGS84 FeatureCollection; its JSON is parsed,
+reprojected and analysed inside Mashup. `-OutputName` keeps examples in separate files.
+
 Run all M test queries with the installed Excel Power Query engine:
 
 ```powershell
@@ -563,6 +672,13 @@ with numeric and unit-bearing radii. The isolated engine host cannot access
 files directly, so the runner supplies `File.Contents` with the committed bytes
 under `tests/data`; the library's actual loaders and binary/JSON parsers run on
 those fixtures. `testRepositoryRoot` supplies a portable fixture path.
+
+`Test13.m` covers planar buffers. `Test14.m` covers generalized Voronoi cells,
+straight and parabolic bisectors, curve vertex counts, filled polygons and holes,
+overlapping and duplicate sites, crossing and collinear lines, multipart sites,
+independent bent-line distance checks, CRS handling, row IDs and rebuilt indexes.
+`Test15.m` checks layer extents after filtering, buffering and reprojection,
+including empty and degenerate extents and use as Voronoi clipping bounds.
 
 The runner supplies `projectionReferences` from the committed M literals in
 `tests/data/projection-references.m`. Their provenance is recorded in
